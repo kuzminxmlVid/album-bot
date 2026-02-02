@@ -1,8 +1,6 @@
-# UPDATED TELEGRAM BOT WITH:
-# - /list command
-# - progress display
-# - async iTunes lookup
-# - multiple album lists support
+# UPDATED TELEGRAM BOT
+# Variant B: iTunes -> Deezer fallback for album covers
+# + /menu command with navigation
 
 import os
 import sqlite3
@@ -55,7 +53,7 @@ def get_albums(list_name):
         album_cache[list_name] = load_albums(list_name)
     return album_cache[list_name]
 
-# ---------------- HELPERS ----------------
+# ---------------- USERS ----------------
 
 def get_user(user_id):
     cursor.execute(
@@ -101,19 +99,19 @@ def set_paused(user_id, value):
     )
     conn.commit()
 
+# ---------------- COVER PROVIDERS ----------------
 
-def artist_google_link(artist):
-    return f"https://www.google.com/search?q={quote_plus(artist)}"
-
-
-async def get_cover_and_year(session, artist, album):
+async def itunes_cover(session, artist, album):
     try:
         async with session.get(
             "https://itunes.apple.com/search",
             params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
-            timeout=10
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
-            data = await r.json()
+            if r.status != 200:
+                return None, None
+            data = await r.json(content_type=None)
 
         if data.get("resultCount", 0) == 0:
             return None, None
@@ -122,25 +120,69 @@ async def get_cover_and_year(session, artist, album):
         cover = item.get("artworkUrl100")
         if cover:
             cover = cover.replace("100x100", "600x600")
-
         year = item.get("releaseDate", "")[:4]
         return cover, year or None
     except Exception:
         return None, None
 
 
+async def deezer_cover(session, artist, album):
+    try:
+        async with session.get(
+            "https://api.deezer.com/search/album",
+            params={"q": f"{artist} {album}"},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+
+        if not data.get("data"):
+            return None
+
+        return data["data"][0].get("cover_xl")
+    except Exception:
+        return None
+
+
+async def get_cover_and_year(session, artist, album):
+    cover, year = await itunes_cover(session, artist, album)
+    if cover:
+        return cover, year
+
+    cover = await deezer_cover(session, artist, album)
+    if cover:
+        return cover, None
+
+    return None, None
+
 # ---------------- UI ----------------
 
-def keyboard(artist):
+def artist_google_link(artist):
+    return f"https://www.google.com/search?q={quote_plus(artist)}"
+
+
+def album_keyboard(artist):
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
         InlineKeyboardButton("🔎 Искать исполнителя", url=artist_google_link(artist)),
         InlineKeyboardButton("➡️ Следующий альбом", callback_data="next"),
         InlineKeyboardButton("📅 Альбом каждый день", callback_data="daily"),
-        InlineKeyboardButton("❌ Остановить", callback_data="stop")
+        InlineKeyboardButton("📋 Меню", callback_data="menu")
     )
     return kb
 
+
+def menu_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("📚 Списки альбомов", callback_data="menu_lists"),
+        InlineKeyboardButton("▶️ Продолжить", callback_data="menu_resume"),
+        InlineKeyboardButton("⏸ Пауза", callback_data="menu_pause")
+    )
+    return kb
+
+# ---------------- CORE ----------------
 
 async def send_album(user_id):
     album_list, index, _, paused = get_user(user_id)
@@ -148,7 +190,6 @@ async def send_album(user_id):
         return
 
     albums = get_albums(album_list)
-
     if index < 0:
         await bot.send_message(user_id, "📭 Альбомы закончились.")
         return
@@ -175,37 +216,55 @@ async def send_album(user_id):
     )
 
     if cover:
-        await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=keyboard(artist))
+        await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=album_keyboard(artist))
     else:
-        await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=keyboard(artist))
+        await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=album_keyboard(artist))
 
     update_index(user_id, index - 1)
 
 # ---------------- COMMANDS ----------------
 
-@dp.message_handler(commands=["start"])
+@dp.message_handler(commands=["start", "menu"])
 async def start(message: types.Message):
     get_user(message.from_user.id)
-    await message.answer("🎧 Я присылаю альбомы по спискам рейтингов.")
-    await send_album(message.from_user.id)
+    await message.answer("📋 Главное меню", reply_markup=menu_keyboard())
 
 
-@dp.message_handler(commands=["list"])
-async def choose_list(message: types.Message):
-    kb = InlineKeyboardMarkup()
+@dp.callback_query_handler(lambda c: c.data == "menu")
+async def menu(call: types.CallbackQuery):
+    await call.message.edit_text("📋 Главное меню", reply_markup=menu_keyboard())
+
+
+@dp.callback_query_handler(lambda c: c.data == "menu_pause")
+async def pause(call: types.CallbackQuery):
+    set_paused(call.from_user.id, 1)
+    await call.answer("⏸ Пауза")
+
+
+@dp.callback_query_handler(lambda c: c.data == "menu_resume")
+async def resume(call: types.CallbackQuery):
+    set_paused(call.from_user.id, 0)
+    await call.answer("▶️ Продолжаем")
+    await send_album(call.from_user.id)
+
+
+@dp.callback_query_handler(lambda c: c.data == "menu_lists")
+async def lists_menu(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(row_width=1)
     for f in os.listdir(ALBUMS_DIR):
         if f.endswith(".xlsx"):
             name = f.replace(".xlsx", "")
             kb.add(InlineKeyboardButton(name, callback_data=f"list:{name}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu"))
 
-    await message.answer("📚 Выбери список альбомов:", reply_markup=kb)
+    await call.message.edit_text("📚 Выбери список альбомов:", reply_markup=kb)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("list:"))
 async def set_list(call: types.CallbackQuery):
     list_name = call.data.split(":", 1)[1]
     set_album_list(call.from_user.id, list_name)
-    await call.answer(f"Список переключён: {list_name}")
+    await call.answer(f"Список: {list_name}")
     await send_album(call.from_user.id)
 
 
@@ -219,26 +278,7 @@ async def next_album(call: types.CallbackQuery):
 async def daily_on(call: types.CallbackQuery):
     cursor.execute("UPDATE users SET daily=1 WHERE user_id=?", (call.from_user.id,))
     conn.commit()
-    await call.answer("📅 Буду присылать альбом каждый день")
-
-
-@dp.callback_query_handler(lambda c: c.data == "stop")
-async def stop_daily(call: types.CallbackQuery):
-    cursor.execute("UPDATE users SET daily=0 WHERE user_id=?", (call.from_user.id,))
-    conn.commit()
-    await call.answer("❌ Рассылка остановлена")
-
-
-@dp.message_handler(commands=["pause"])
-async def pause(message: types.Message):
-    set_paused(message.from_user.id, 1)
-    await message.answer("⏸ Бот на паузе")
-
-
-@dp.message_handler(commands=["resume"])
-async def resume(message: types.Message):
-    set_paused(message.from_user.id, 0)
-    await message.answer("▶️ Бот снова активен")
+    await call.answer("📅 Daily включён")
 
 # ---------------- DAILY ----------------
 
