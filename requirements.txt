@@ -2,3 +2,4 @@ aiogram
 pandas
 openpyxl
 apscheduler
+requests
