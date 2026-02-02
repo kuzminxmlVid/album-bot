@@ -1,94 +1,78 @@
+# UPDATED TELEGRAM BOT WITH:
+# - /list command
+# - progress display
+# - async iTunes lookup
+# - multiple album lists support
+
 import os
 import sqlite3
 import pandas as pd
-import requests
+import aiohttp
 from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-
-# --- TOKEN ---
+# ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("TOKEN не задан в переменных окружения")
 
+ALBUMS_DIR = "albums"
+DEFAULT_LIST = os.getenv("ALBUM_LIST", "top100")
+
+# ---------------- BOT ----------------
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 scheduler = AsyncIOScheduler()
 
-
-# --- ALBUMS ---
-albums = pd.read_excel("albums.xlsx")
-
-# сортируем по rank и начинаем с последнего
-albums = albums.sort_values("rank").reset_index(drop=True)
-
-
-# --- DB ---
+# ---------------- DB ----------------
 conn = sqlite3.connect("users.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
+    album_list TEXT,
     current_index INTEGER,
-    daily INTEGER
+    daily INTEGER,
+    paused INTEGER
 )
 """)
 conn.commit()
 
+# ---------------- ALBUM LISTS ----------------
 
-# --- HELPERS ---
+def load_albums(list_name: str):
+    df = pd.read_excel(f"{ALBUMS_DIR}/{list_name}.xlsx")
+    return df.sort_values("rank").reset_index(drop=True)
 
-def generate_song_link(artist, album):
-    q = quote_plus(f"{artist} {album}")
-    return f"https://song.link/search?q={q}"
+album_cache = {}
 
+def get_albums(list_name):
+    if list_name not in album_cache:
+        album_cache[list_name] = load_albums(list_name)
+    return album_cache[list_name]
 
-def get_cover_and_year(artist, album):
-    try:
-        r = requests.get(
-            "https://itunes.apple.com/search",
-            params={
-                "term": f"{artist} {album}",
-                "entity": "album",
-                "limit": 1
-            },
-            timeout=10
-        )
-        data = r.json()
-        if data["resultCount"] == 0:
-            return None, None
-
-        item = data["results"][0]
-        cover = item.get("artworkUrl100")
-        if cover:
-            cover = cover.replace("100x100", "600x600")
-
-        year = item.get("releaseDate", "")[:4]
-        return cover, year or None
-
-    except Exception:
-        return None, None
-
+# ---------------- HELPERS ----------------
 
 def get_user(user_id):
     cursor.execute(
-        "SELECT current_index, daily FROM users WHERE user_id=?",
+        "SELECT album_list, current_index, daily, paused FROM users WHERE user_id=?",
         (user_id,)
     )
     row = cursor.fetchone()
 
     if row is None:
+        albums = get_albums(DEFAULT_LIST)
         start_index = len(albums) - 1
         cursor.execute(
-            "INSERT INTO users VALUES (?, ?, ?)",
-            (user_id, start_index, 0)
+            "INSERT INTO users VALUES (?, ?, ?, ?, ?)",
+            (user_id, DEFAULT_LIST, start_index, 0, 0)
         )
         conn.commit()
-        return start_index, 0
+        return DEFAULT_LIST, start_index, 0, 0
 
     return row
 
@@ -101,21 +85,56 @@ def update_index(user_id, index):
     conn.commit()
 
 
-def set_daily(user_id, value):
+def set_album_list(user_id, list_name):
+    albums = get_albums(list_name)
     cursor.execute(
-        "UPDATE users SET daily=? WHERE user_id=?",
+        "UPDATE users SET album_list=?, current_index=? WHERE user_id=?",
+        (list_name, len(albums) - 1, user_id)
+    )
+    conn.commit()
+
+
+def set_paused(user_id, value):
+    cursor.execute(
+        "UPDATE users SET paused=? WHERE user_id=?",
         (value, user_id)
     )
     conn.commit()
 
 
-def keyboard(artist, album):
+def artist_google_link(artist):
+    return f"https://www.google.com/search?q={quote_plus(artist)}"
+
+
+async def get_cover_and_year(session, artist, album):
+    try:
+        async with session.get(
+            "https://itunes.apple.com/search",
+            params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
+            timeout=10
+        ) as r:
+            data = await r.json()
+
+        if data.get("resultCount", 0) == 0:
+            return None, None
+
+        item = data["results"][0]
+        cover = item.get("artworkUrl100")
+        if cover:
+            cover = cover.replace("100x100", "600x600")
+
+        year = item.get("releaseDate", "")[:4]
+        return cover, year or None
+    except Exception:
+        return None, None
+
+
+# ---------------- UI ----------------
+
+def keyboard(artist):
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton(
-            "🎧 Слушать на стримингах",
-            url=generate_song_link(artist, album)
-        ),
+        InlineKeyboardButton("🔎 Искать исполнителя", url=artist_google_link(artist)),
         InlineKeyboardButton("➡️ Следующий альбом", callback_data="next"),
         InlineKeyboardButton("📅 Альбом каждый день", callback_data="daily"),
         InlineKeyboardButton("❌ Остановить", callback_data="stop")
@@ -124,7 +143,11 @@ def keyboard(artist, album):
 
 
 async def send_album(user_id):
-    index, _ = get_user(user_id)
+    album_list, index, _, paused = get_user(user_id)
+    if paused:
+        return
+
+    albums = get_albums(album_list)
 
     if index < 0:
         await bot.send_message(user_id, "📭 Альбомы закончились.")
@@ -132,47 +155,58 @@ async def send_album(user_id):
 
     row = albums.iloc[index]
     artist = row["artist"]
-    album_name = row["album"]
+    album = row["album"]
     genre = row["genre"]
+    rank = row["rank"]
 
-    cover, year = get_cover_and_year(artist, album_name)
+    total = len(albums)
+    progress = total - index
+
+    async with aiohttp.ClientSession() as session:
+        cover, year = await get_cover_and_year(session, artist, album)
 
     caption = (
+        f"🏆 <b>#{rank}</b>\n"
         f"🎤 <b>{artist}</b>\n"
-        f"💿 <b>{album_name}</b>\n"
+        f"💿 <b>{album}</b>\n"
         f"📅 {year or '—'}\n"
-        f"🎧 {genre}"
+        f"🎧 {genre}\n"
+        f"📊 Прогресс: {progress}/{total}"
     )
 
     if cover:
-        await bot.send_photo(
-            chat_id=user_id,
-            photo=cover,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=keyboard(artist, album_name)
-        )
+        await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=keyboard(artist))
     else:
-        await bot.send_message(
-            chat_id=user_id,
-            text=caption,
-            parse_mode="HTML",
-            reply_markup=keyboard(artist, album_name)
-        )
+        await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=keyboard(artist))
 
     update_index(user_id, index - 1)
 
-
-# --- HANDLERS ---
+# ---------------- COMMANDS ----------------
 
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
     get_user(message.from_user.id)
-    await message.answer(
-        "🎧 Я присылаю альбомы по порядку рейтинга.\n"
-        "Можно листать вручную или включить ежедневную подборку."
-    )
+    await message.answer("🎧 Я присылаю альбомы по спискам рейтингов.")
     await send_album(message.from_user.id)
+
+
+@dp.message_handler(commands=["list"])
+async def choose_list(message: types.Message):
+    kb = InlineKeyboardMarkup()
+    for f in os.listdir(ALBUMS_DIR):
+        if f.endswith(".xlsx"):
+            name = f.replace(".xlsx", "")
+            kb.add(InlineKeyboardButton(name, callback_data=f"list:{name}"))
+
+    await message.answer("📚 Выбери список альбомов:", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("list:"))
+async def set_list(call: types.CallbackQuery):
+    list_name = call.data.split(":", 1)[1]
+    set_album_list(call.from_user.id, list_name)
+    await call.answer(f"Список переключён: {list_name}")
+    await send_album(call.from_user.id)
 
 
 @dp.callback_query_handler(lambda c: c.data == "next")
@@ -183,20 +217,33 @@ async def next_album(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "daily")
 async def daily_on(call: types.CallbackQuery):
-    set_daily(call.from_user.id, 1)
+    cursor.execute("UPDATE users SET daily=1 WHERE user_id=?", (call.from_user.id,))
+    conn.commit()
     await call.answer("📅 Буду присылать альбом каждый день")
 
 
 @dp.callback_query_handler(lambda c: c.data == "stop")
-async def daily_off(call: types.CallbackQuery):
-    set_daily(call.from_user.id, 0)
+async def stop_daily(call: types.CallbackQuery):
+    cursor.execute("UPDATE users SET daily=0 WHERE user_id=?", (call.from_user.id,))
+    conn.commit()
     await call.answer("❌ Рассылка остановлена")
 
 
-# --- DAILY JOB ---
+@dp.message_handler(commands=["pause"])
+async def pause(message: types.Message):
+    set_paused(message.from_user.id, 1)
+    await message.answer("⏸ Бот на паузе")
+
+
+@dp.message_handler(commands=["resume"])
+async def resume(message: types.Message):
+    set_paused(message.from_user.id, 0)
+    await message.answer("▶️ Бот снова активен")
+
+# ---------------- DAILY ----------------
 
 async def daily_job():
-    cursor.execute("SELECT user_id FROM users WHERE daily=1")
+    cursor.execute("SELECT user_id FROM users WHERE daily=1 AND paused=0")
     for (user_id,) in cursor.fetchall():
         await send_album(user_id)
 
