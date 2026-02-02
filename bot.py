@@ -1,13 +1,13 @@
 {\rtf1\ansi\ansicpg1251\cocoartf2867
 \cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fmodern\fcharset0 Courier;}
-{\colortbl;\red255\green255\blue255;\red255\green255\blue255;}
-{\*\expandedcolortbl;;\cssrgb\c100000\c100000\c100000;}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;\red255\green255\blue255;}
+{\*\expandedcolortbl;;\csgray\c0;\cssrgb\c100000\c100000\c100000;}
 \paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
 \deftab720
 \pard\pardeftab720\partightenfactor0
 
 \f0\fs26 \cf2 \expnd0\expndtw0\kerning0
-\outl0\strokewidth0 \strokec2 import sqlite3\
+\outl0\strokewidth0 \strokec3 import sqlite3\
 import pandas as pd\
 from urllib.parse import quote_plus\
 \
@@ -15,7 +15,8 @@ from aiogram import Bot, Dispatcher, executor, types\
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton\
 from apscheduler.schedulers.asyncio import AsyncIOScheduler\
 \
-TOKEN = "\uc0\u1058 \u1042 \u1054 \u1049 _TELEGRAM_BOT_TOKEN"\
+import os\
+TOKEN = os.getenv("8371822015:AAE_3c4AtWc8t8VCDl_0dj3xQOMAAkkQFRw")\
 \
 bot = Bot(token=TOKEN)\
 dp = Dispatcher(bot)\
