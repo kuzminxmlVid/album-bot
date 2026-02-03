@@ -145,6 +145,39 @@ def get_albums(name: str) -> pd.DataFrame:
         album_cache[name] = load_albums(name)
     return album_cache[name]
 
+def available_album_lists() -> list[str]:
+    """Return available album list names (xlsx file stems) from albums directory."""
+    names: list[str] = []
+    try:
+        for fn in os.listdir(Config.ALBUMS_DIR):
+            if not fn.lower().endswith(".xlsx"):
+                continue
+            if fn.startswith("~$"):  # Excel temp files
+                continue
+            names.append(os.path.splitext(fn)[0])
+    except FileNotFoundError:
+        return []
+    return sorted(set(names))
+
+
+async def set_user_album_list(user_id: int, album_list: str) -> Tuple[str, int]:
+    """Switch user's current album list and reset index to the end of that list."""
+    albums = get_albums(album_list)  # validates and loads list
+    idx = len(albums) - 1
+
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, album_list, current_index)
+            VALUES ($1,$2,$3)
+            ON CONFLICT (user_id)
+            DO UPDATE SET album_list=EXCLUDED.album_list, current_index=EXCLUDED.current_index
+            """,
+            user_id, album_list, idx
+        )
+    return album_list, idx
+
+
 # ================= USERS =================
 
 async def get_user(user_id: int) -> Tuple[str, int]:
@@ -387,7 +420,21 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
         [InlineKeyboardButton(text="🔄 Сначала списка", callback_data="nav:reset")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
+        [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
+
+def lists_keyboard(names: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    # Two buttons per row
+    for i in range(0, len(names), 2):
+        row = []
+        row.append(InlineKeyboardButton(text=names[i], callback_data=f"setlist:{names[i]}"))
+        if i + 1 < len(names):
+            row.append(InlineKeyboardButton(text=names[i+1], callback_data=f"setlist:{names[i+1]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="ui:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 
 def album_caption(row: pd.Series, user_rating: Optional[int]) -> str:
@@ -547,6 +594,68 @@ async def start(msg: Message):
 @router.message(Command("menu"))
 async def menu_cmd(msg: Message):
     await msg.answer("📋 Меню", reply_markup=menu_keyboard())
+
+
+
+@router.message(Command("lists"))
+async def lists_cmd(msg: Message):
+    names = available_album_lists()
+    if not names:
+        await msg.answer("Не нашёл ни одного списка в папке albums.")
+        return
+    await msg.answer("📚 Выбери список:", reply_markup=lists_keyboard(names))
+
+
+@router.message(Command("set_list"))
+async def set_list_cmd(msg: Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        names = available_album_lists()
+        if names:
+            await msg.answer(
+                "Напиши так: /set_list <название_списка>\n\nДоступные списки:\n" + "\n".join(names)
+            )
+        else:
+            await msg.answer("Напиши так: /set_list <название_списка>")
+        return
+
+    wanted = parts[1].strip()
+    names = available_album_lists()
+    if wanted not in names:
+        # try case-insensitive match
+        low = {n.lower(): n for n in names}
+        wanted2 = low.get(wanted.lower())
+        if not wanted2:
+            await msg.answer("Не нашёл такой список. Доступные:\n" + "\n".join(names))
+            return
+        wanted = wanted2
+
+    await set_user_album_list(msg.from_user.id, wanted)
+    await msg.answer(f"✅ Список выбран: <b>{wanted}</b>", parse_mode="HTML")
+    await send_album_post(msg.from_user.id)
+
+
+@router.callback_query(F.data == "ui:lists")
+async def lists_cb(call: CallbackQuery):
+    names = available_album_lists()
+    if not names:
+        await call.answer("Списков нет", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer("📚 Выбери список:", reply_markup=lists_keyboard(names))
+
+
+@router.callback_query(F.data.startswith("setlist:"))
+async def setlist_cb(call: CallbackQuery):
+    wanted = call.data.split(":", 1)[1]
+    names = available_album_lists()
+    if wanted not in names:
+        await call.answer("Список не найден", show_alert=True)
+        return
+    await set_user_album_list(call.from_user.id, wanted)
+    await call.answer(f"Список: {wanted}")
+    await call.message.answer(f"✅ Список выбран: <b>{wanted}</b>", parse_mode="HTML")
+    await send_album_post(call.from_user.id)
 
 
 @router.message(Command("start_albums"))
