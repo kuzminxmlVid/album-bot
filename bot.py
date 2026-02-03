@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from typing import Optional, Tuple, Dict
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -71,6 +71,26 @@ async def init_pg() -> None:
             album_list TEXT NOT NULL,
             current_index INTEGER NOT NULL
         )
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_progress (
+            user_id BIGINT NOT NULL,
+            album_list TEXT NOT NULL,
+            current_index INTEGER NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (user_id, album_list)
+        )
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_progress_user
+        ON user_progress (user_id)
+        """)
+        # Миграция старых данных из users (если раньше индекс хранился только там)
+        await conn.execute("""
+        INSERT INTO user_progress (user_id, album_list, current_index, updated_at)
+        SELECT user_id, album_list, current_index, NOW()
+        FROM users
+        ON CONFLICT (user_id, album_list) DO NOTHING
         """)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS ratings (
@@ -160,11 +180,46 @@ def available_album_lists() -> list[str]:
     return sorted(set(names))
 
 
-async def set_user_album_list(user_id: int, album_list: str) -> Tuple[str, int]:
-    """Switch user's current album list and reset index to the end of that list."""
-    albums = get_albums(album_list)  # validates and loads list
-    idx = len(albums) - 1
+async def get_progress(user_id: int, album_list: str) -> int:
+    """Get user's current index for a given list. If missing, init to end of list."""
+    albums = get_albums(album_list)
+    default_idx = len(albums) - 1
+    now = datetime.now(timezone.utc)
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT current_index FROM user_progress WHERE user_id=$1 AND album_list=$2",
+            user_id, album_list
+        )
+        if row:
+            return int(row["current_index"])
+        await conn.execute(
+            """
+            INSERT INTO user_progress (user_id, album_list, current_index, updated_at)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (user_id, album_list) DO NOTHING
+            """,
+            user_id, album_list, default_idx, now
+        )
+    return default_idx
 
+
+async def set_progress(user_id: int, album_list: str, idx: int) -> None:
+    now = datetime.now(timezone.utc)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_progress (user_id, album_list, current_index, updated_at)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (user_id, album_list)
+            DO UPDATE SET current_index=EXCLUDED.current_index, updated_at=EXCLUDED.updated_at
+            """,
+            user_id, album_list, idx, now
+        )
+
+
+async def set_user_album_list(user_id: int, album_list: str) -> Tuple[str, int]:
+    """Switch user's current album list and restore their saved position in that list."""
+    idx = await get_progress(user_id, album_list)
     async with _pool().acquire() as conn:
         await conn.execute(
             """
@@ -183,20 +238,29 @@ async def set_user_album_list(user_id: int, album_list: str) -> Tuple[str, int]:
 async def get_user(user_id: int) -> Tuple[str, int]:
     async with _pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT album_list, current_index FROM users WHERE user_id=$1",
+            "SELECT album_list FROM users WHERE user_id=$1",
             user_id
         )
         if not row:
-            albums = get_albums(Config.DEFAULT_LIST)
-            idx = len(albums) - 1
+            album_list = Config.DEFAULT_LIST
+            idx = await get_progress(user_id, album_list)
             await conn.execute(
                 "INSERT INTO users (user_id, album_list, current_index) VALUES ($1,$2,$3)",
-                user_id, Config.DEFAULT_LIST, idx
+                user_id, album_list, idx
             )
-            return Config.DEFAULT_LIST, idx
-        return row["album_list"], row["current_index"]
+            return album_list, idx
+
+        album_list = row["album_list"]
+        idx = await get_progress(user_id, album_list)
+        await conn.execute(
+            "UPDATE users SET current_index=$1 WHERE user_id=$2",
+            idx, user_id
+        )
+        return album_list, idx
 
 async def set_index(user_id: int, idx: int) -> None:
+    album_list, _ = await get_user(user_id)
+    await set_progress(user_id, album_list, idx)
     async with _pool().acquire() as conn:
         await conn.execute(
             "UPDATE users SET current_index=$1 WHERE user_id=$2",
@@ -390,35 +454,44 @@ def google_link(artist: str, album: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
 
-def album_keyboard(artist: str, album: str, rated: Optional[int]) -> InlineKeyboardMarkup:
+def album_keyboard(artist: str, album: str, rated: Optional[int], album_list: str, rank: int) -> InlineKeyboardMarkup:
     rate_text = "⭐ Оценить" if not rated else f"⭐ Оценено: {rated}"
+    lst = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎧 Найти альбом", url=google_link(artist, album))],
         [
-            InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
-            InlineKeyboardButton(text="Пропустить", callback_data="nav:next")
+            InlineKeyboardButton(text="Прыдыдущий альбом", callback_data=f"nav:prev:{lst}:{rank}"),
+            InlineKeyboardButton(text="Пропустить", callback_data=f"nav:next:{lst}:{rank}")
         ],
         [
-            InlineKeyboardButton(text=rate_text, callback_data="ui:rate"),
+            InlineKeyboardButton(text=rate_text, callback_data=f"ui:rate:{lst}:{rank}"),
             InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")
         ]
     ])
 
+def encode_list_name(name: str) -> str:
+    # callback_data must be ASCII; percent-encode
+    return quote(name, safe="")
+
+def decode_list_name(encoded: str) -> str:
+    return unquote_plus(encoded)
+
+
 
 def rating_keyboard(album_list: str, rank: int) -> InlineKeyboardMarkup:
+    lst = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=f"⭐ {i}", callback_data=f"rate:{i}:{album_list}:{rank}")
+            InlineKeyboardButton(text=f"⭐ {i}", callback_data=f"rate:{i}:{lst}:{rank}")
             for i in range(1, 6)
         ],
-        [InlineKeyboardButton(text="⬅️ Назад к посту", callback_data="ui:back")]
+        [InlineKeyboardButton(text="⬅️ Назад к посту", callback_data=f"ui:back:{lst}:{rank}")]
     ])
-
 
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
-        [InlineKeyboardButton(text="🔄 Сначала списка", callback_data="nav:reset")],
+        [InlineKeyboardButton(text="▶️ Продолжить", callback_data="navc:next")],
+        [InlineKeyboardButton(text="🔄 Сначала списка", callback_data="navc:reset")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
@@ -428,9 +501,9 @@ def lists_keyboard(names: list[str]) -> InlineKeyboardMarkup:
     # Two buttons per row
     for i in range(0, len(names), 2):
         row = []
-        row.append(InlineKeyboardButton(text=names[i], callback_data=f"setlist:{names[i]}"))
+        row.append(InlineKeyboardButton(text=names[i], callback_data=f"setlist:{encode_list_name(names[i])}"))
         if i + 1 < len(names):
-            row.append(InlineKeyboardButton(text=names[i+1], callback_data=f"setlist:{names[i+1]}"))
+            row.append(InlineKeyboardButton(text=names[i+1], callback_data=f"setlist:{encode_list_name(names[i+1])}"))
         rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="ui:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -450,12 +523,20 @@ def album_caption(row: pd.Series, user_rating: Optional[int]) -> str:
 
 # ================= CORE =================
 
-async def render_album(user_id: int) -> Tuple[Optional[str], str, InlineKeyboardMarkup, str, int, Optional[int], str, str]:
-    album_list, idx = await get_user(user_id)
+async def render_album(user_id: int, album_list_override: Optional[str] = None) -> Tuple[Optional[str], str, InlineKeyboardMarkup, str, int, Optional[int], str, str, int]:
+    """
+    Returns: cover_url, caption, keyboard, album_list, rank, user_rating, artist, album, idx
+    """
+    if album_list_override:
+        album_list = album_list_override
+        idx = await get_progress(user_id, album_list)
+    else:
+        album_list, idx = await get_user(user_id)
+
     albums = get_albums(album_list)
 
     if idx < 0 or idx >= len(albums):
-        return None, "📭 Альбомы закончились", InlineKeyboardMarkup(inline_keyboard=[]), album_list, -1, None, "", ""
+        return None, "📭 Альбомы закончились", InlineKeyboardMarkup(inline_keyboard=[]), album_list, -1, None, "", "", idx
 
     row = albums.iloc[idx]
     rank = int(row["rank"])
@@ -463,14 +544,15 @@ async def render_album(user_id: int) -> Tuple[Optional[str], str, InlineKeyboard
     album = str(row["album"])
 
     user_rating = await get_user_rating(user_id, album_list, rank)
+
     cover = await get_cover_with_fallback(album_list, rank, artist, album)
     caption = album_caption(row, user_rating)
-    kb = album_keyboard(artist, album, user_rating)
-    return cover, caption, kb, album_list, rank, user_rating, artist, album
+    kb = album_keyboard(str(row['artist']), str(row['album']), rating, album_list, rank)
+    return cover, caption, kb, album_list, rank, user_rating, artist, album, idx
 
 
-async def send_album_post(user_id: int) -> None:
-    cover, caption, kb, album_list, rank, _, artist, album = await render_album(user_id)
+async def send_album_post(user_id: int, album_list_override: Optional[str] = None) -> None:
+    cover, caption, kb, album_list, rank, _, artist, album, idx = await render_album(user_id, album_list_override=album_list_override)
 
     if caption.startswith("📭"):
         await bot.send_message(user_id, caption)
@@ -482,7 +564,6 @@ async def send_album_post(user_id: int) -> None:
             await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=kb)
             return
         except TelegramBadRequest as e:
-            # Telegram не смог скачать картинку по URL (часто из-за временных проблем или блокировок хоста)
             log.warning(
                 "Telegram cannot fetch cover URL (list=%s rank=%s url=%s): %s",
                 album_list, rank, cover, e
@@ -512,7 +593,7 @@ async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, ran
         return
     row = row.iloc[0]
     caption = album_caption(row, rating)
-    kb = album_keyboard(str(row["artist"]), str(row["album"]), rating)
+    kb = album_keyboard(str(row["artist"]), str(row["album"]), rating, album_list, rank)
 
     try:
         if call.message.photo:
@@ -633,6 +714,35 @@ async def set_list_cmd(msg: Message):
     await set_user_album_list(msg.from_user.id, wanted)
     await msg.answer(f"✅ Список выбран: <b>{wanted}</b>", parse_mode="HTML")
     await send_album_post(msg.from_user.id)
+
+
+
+@router.message(Command("next_from"))
+async def next_from_cmd(msg: Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("Напиши так: /next_from <название_списка>")
+        return
+    wanted = parts[1].strip()
+    names = available_album_lists()
+    if wanted not in names:
+        low = {n.lower(): n for n in names}
+        wanted2 = low.get(wanted.lower())
+        if not wanted2:
+            await msg.answer("Не нашёл такой список. Доступные:\n" + "\n".join(names))
+            return
+        wanted = wanted2
+
+    # Берём текущий альбом из другого списка, продвигаем его прогресс, но НЕ меняем текущий активный список пользователя
+    idx = await get_progress(msg.from_user.id, wanted)
+    albums = get_albums(wanted)
+    if idx < 0 or idx >= len(albums):
+        await msg.answer("📭 В этом списке альбомы закончились")
+        return
+    # отправим текущий
+    await send_album_post(msg.from_user.id, album_list_override=wanted)
+    # и продвинем прогресс как "пропустить"
+    await set_progress(msg.from_user.id, wanted, idx - 1)
 
 
 @router.callback_query(F.data == "ui:lists")
@@ -789,29 +899,60 @@ async def export_ratings_cmd(msg: Message):
 
 @router.callback_query(F.data.startswith("nav:"))
 async def nav_cb(call: CallbackQuery):
-    album_list, idx = await get_user(call.from_user.id)
-    action = call.data.split(":", 1)[1]
+    parts = call.data.split(":")
+    # nav:<action>:<list>:<rank>
+    if len(parts) != 4:
+        await call.answer()
+        return
+    action = parts[1]
+    album_list = decode_list_name(parts[2])
+    rank = int(parts[3])
+
+    albums = get_albums(album_list)
+    idx_series = albums.index[albums["rank"] == rank]
+    if len(idx_series) == 0:
+        await call.answer("Не нашёл альбом", show_alert=True)
+        return
+    idx = int(idx_series[0])
 
     if action == "next":
-        await set_index(call.from_user.id, idx - 1)
+        new_idx = idx - 1
+        await set_progress(call.from_user.id, album_list, new_idx)
         await call.answer()
-        await send_album_post(call.from_user.id)
+        await send_album_post(call.from_user.id, album_list_override=album_list)
         return
 
     if action == "prev":
-        await set_index(call.from_user.id, idx + 1)
+        new_idx = idx + 1
+        await set_progress(call.from_user.id, album_list, new_idx)
+        await call.answer()
+        await send_album_post(call.from_user.id, album_list_override=album_list)
+        return
+
+    await call.answer()
+
+
+
+@router.callback_query(F.data.startswith("navc:"))
+async def nav_current_cb(call: CallbackQuery):
+    action = call.data.split(":", 1)[1]
+    album_list, idx = await get_user(call.from_user.id)
+    albums = get_albums(album_list)
+
+    if action == "next":
+        await set_progress(call.from_user.id, album_list, idx - 1)
         await call.answer()
         await send_album_post(call.from_user.id)
         return
 
     if action == "reset":
-        albums = get_albums(album_list)
-        await set_index(call.from_user.id, len(albums) - 1)
+        await set_progress(call.from_user.id, album_list, len(albums) - 1)
         await call.answer("Сброшено")
         await send_album_post(call.from_user.id)
         return
 
     await call.answer()
+
 
 @router.callback_query(F.data == "ui:menu")
 async def menu_cb(call: CallbackQuery):
@@ -824,17 +965,22 @@ async def stats_cb(call: CallbackQuery):
     await call.answer()
     await call.message.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
 
-@router.callback_query(F.data == "ui:rate")
+@router.callback_query(F.data.startswith("ui:rate:"))
 async def rate_ui(call: CallbackQuery):
-    album_list, idx = await get_user(call.from_user.id)
-    albums = get_albums(album_list)
-
-    if idx < 0 or idx >= len(albums):
-        await call.answer("Альбомы закончились", show_alert=True)
+    parts = call.data.split(":")
+    if len(parts) != 4:
+        await call.answer("Ошибка кнопки", show_alert=True)
         return
+    album_list = decode_list_name(parts[2])
+    rank = int(parts[3])
 
-    row = albums.iloc[idx]
-    rank = int(row["rank"])
+    albums = get_albums(album_list)
+    row = albums.loc[albums["rank"] == rank]
+    if row.empty:
+        await call.answer("Не нашёл альбом", show_alert=True)
+        return
+    row = row.iloc[0]
+
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
     caption = album_caption(row, current_rating)
 
@@ -856,6 +1002,7 @@ async def rate_ui(call: CallbackQuery):
         log.debug("rate ui edit failed: %s", e)
         await bot.send_message(call.from_user.id, "Оцени альбом:", reply_markup=rating_keyboard(album_list, rank))
 
+
 @router.callback_query(F.data.startswith("rate:"))
 async def rate_set(call: CallbackQuery):
     parts = call.data.split(":")
@@ -864,7 +1011,7 @@ async def rate_set(call: CallbackQuery):
         return
 
     rating = int(parts[1])
-    album_list = parts[2]
+    album_list = decode_list_name(parts[2])
     rank = int(parts[3])
 
     await upsert_rating(call.from_user.id, album_list, rank, rating)
@@ -880,22 +1027,28 @@ async def rate_set(call: CallbackQuery):
         return
     idx = int(idx_series[0])
 
-    await set_index(call.from_user.id, idx - 1)
-    await send_album_post(call.from_user.id)
+    await set_progress(call.from_user.id, album_list, idx - 1)
+    await send_album_post(call.from_user.id, album_list_override=album_list)
 
-@router.callback_query(F.data == "ui:back")
+@router.callback_query(F.data.startswith("ui:back:"))
 async def back(call: CallbackQuery):
-    album_list, idx = await get_user(call.from_user.id)
-    albums = get_albums(album_list)
-    if idx < 0 or idx >= len(albums):
+    parts = call.data.split(":")
+    if len(parts) != 4:
         await call.answer()
         return
+    album_list = decode_list_name(parts[2])
+    rank = int(parts[3])
 
-    row = albums.iloc[idx]
-    rank = int(row["rank"])
+    albums = get_albums(album_list)
+    row = albums.loc[albums["rank"] == rank]
+    if row.empty:
+        await call.answer()
+        return
+    row = row.iloc[0]
+
     ur = await get_user_rating(call.from_user.id, album_list, rank)
     caption = album_caption(row, ur)
-    kb = album_keyboard(str(row["artist"]), str(row["album"]), ur)
+    kb = album_keyboard(str(row["artist"]), str(row["album"]), ur, album_list, rank)
 
     await call.answer()
     try:
@@ -905,6 +1058,7 @@ async def back(call: CallbackQuery):
             await call.message.edit_text(caption, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         log.debug("back edit failed: %s", e)
+
 
 # ================= START / SHUTDOWN =================
 
