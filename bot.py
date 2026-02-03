@@ -17,6 +17,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from aiogram.exceptions import TelegramBadRequest
 
 # ================= LOGGING =================
 
@@ -36,8 +37,7 @@ class Config:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     ALBUMS_DIR = os.getenv("ALBUMS_DIR", os.path.join(BASE_DIR, "albums"))
 
-    # MusicBrainz требует User-Agent. Лучше указать контакт.
-    # Можно задать переменной окружения MB_CONTACT, например "you@example.com"
+    # MusicBrainz просит указывать контакт в User-Agent (почта или сайт).
     MB_CONTACT = os.getenv("MB_CONTACT", "contact:not_set")
     MB_APP = os.getenv("MB_APP", "MusicAlbumClubBot/1.0")
 
@@ -146,7 +146,7 @@ async def get_user(user_id: int) -> Tuple[str, int]:
         )
         if not row:
             albums = get_albums(Config.DEFAULT_LIST)
-            idx = len(albums) - 1  # start from the end and go backwards
+            idx = len(albums) - 1
             await conn.execute(
                 "INSERT INTO users (user_id, album_list, current_index) VALUES ($1,$2,$3)",
                 user_id, Config.DEFAULT_LIST, idx
@@ -199,6 +199,10 @@ async def set_cached_cover(album_list: str, rank: int, cover_url: str, source: s
             """,
             album_list, rank, cover_url, source, now
         )
+
+async def delete_cached_cover(album_list: str, rank: int) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute("DELETE FROM covers WHERE album_list=$1 AND rank=$2", album_list, rank)
 
 # ================= COVER SOURCES =================
 
@@ -308,6 +312,7 @@ async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -
 def google_link(artist: str, album: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
+
 def album_keyboard(artist: str, album: str, rated: Optional[int]) -> InlineKeyboardMarkup:
     rate_text = "⭐ Оценить" if not rated else f"⭐ Оценено: {rated}"
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -322,6 +327,7 @@ def album_keyboard(artist: str, album: str, rated: Optional[int]) -> InlineKeybo
         ]
     ])
 
+
 def rating_keyboard(album_list: str, rank: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -331,12 +337,14 @@ def rating_keyboard(album_list: str, rank: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад к посту", callback_data="ui:back")]
     ])
 
+
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
         [InlineKeyboardButton(text="🔄 Сначала списка", callback_data="nav:reset")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
     ])
+
 
 def album_caption(row: pd.Series, user_rating: Optional[int]) -> str:
     genre = str(row.get("genre", "") or "")
@@ -351,33 +359,44 @@ def album_caption(row: pd.Series, user_rating: Optional[int]) -> str:
 
 # ================= CORE =================
 
-async def render_album(user_id: int) -> Tuple[Optional[str], str, InlineKeyboardMarkup, str, int, Optional[int]]:
+async def render_album(user_id: int) -> Tuple[Optional[str], str, InlineKeyboardMarkup, str, int, Optional[int], str, str]:
     album_list, idx = await get_user(user_id)
     albums = get_albums(album_list)
 
     if idx < 0 or idx >= len(albums):
-        return None, "📭 Альбомы закончились", InlineKeyboardMarkup(inline_keyboard=[]), album_list, -1, None
+        return None, "📭 Альбомы закончились", InlineKeyboardMarkup(inline_keyboard=[]), album_list, -1, None, "", ""
 
     row = albums.iloc[idx]
     rank = int(row["rank"])
-    user_rating = await get_user_rating(user_id, album_list, rank)
+    artist = str(row["artist"])
+    album = str(row["album"])
 
-    cover = await get_cover_with_fallback(album_list, rank, str(row["artist"]), str(row["album"]))
+    user_rating = await get_user_rating(user_id, album_list, rank)
+    cover = await get_cover_with_fallback(album_list, rank, artist, album)
     caption = album_caption(row, user_rating)
-    kb = album_keyboard(str(row["artist"]), str(row["album"]), user_rating)
-    return cover, caption, kb, album_list, rank, user_rating
+    kb = album_keyboard(artist, album, user_rating)
+    return cover, caption, kb, album_list, rank, user_rating, artist, album
+
 
 async def send_album_post(user_id: int) -> None:
-    cover, caption, kb, _, _, _ = await render_album(user_id)
+    cover, caption, kb, album_list, rank, _, artist, album = await render_album(user_id)
 
     if caption.startswith("📭"):
         await bot.send_message(user_id, caption)
         return
 
     if cover:
-        await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=kb)
-    else:
-        await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=kb)
+        try:
+            await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=kb)
+            return
+        except TelegramBadRequest as e:
+            # Telegram не смог скачать картинку по URL (часто из-за временных проблем или блокировок хоста)
+            log.warning("Telegram cannot fetch cover URL (list=%s rank=%s url=%s): %s", album_list, rank, cover, e)
+            # Убираем кэш, чтобы в следующий раз попробовать другой источник
+            await delete_cached_cover(album_list, rank)
+            # Фоллбек: отправим без фото, чтобы бот не падал
+    await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=kb)
+
 
 async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, rank: int, rating: int) -> None:
     albums = get_albums(album_list)
@@ -429,10 +448,16 @@ async def build_stats_text(user_id: int) -> str:
     )
 
 # ================= ERROR HANDLER =================
+# В aiogram v3 @router.errors() передаёт один аргумент event.
+# Исключение лежит в event.exception
 
 @router.errors()
-async def on_error(event, exception):
-    log.exception("Unhandled error: %s", exception)
+async def on_error(event):
+    exc = getattr(event, "exception", None)
+    if exc:
+        log.exception("Unhandled error", exc_info=exc)
+    else:
+        log.exception("Unhandled error (no exception in event)")
     return True
 
 # ================= HANDLERS =================
@@ -534,10 +559,10 @@ async def rate_set(call: CallbackQuery):
     await upsert_rating(call.from_user.id, album_list, rank, rating)
     await call.answer(f"⭐ {rating} сохранено")
 
-    # 1) show rating in THIS post
+    # 1) показать оценку в текущем посте
     await edit_album_post_after_rating(call, album_list, rank, rating)
 
-    # 2) send next album as a NEW post
+    # 2) перейти к следующему альбому и отправить его отдельным постом
     albums = get_albums(album_list)
     idx_series = albums.index[albums["rank"] == rank]
     if len(idx_series) == 0:
