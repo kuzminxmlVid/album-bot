@@ -82,6 +82,14 @@ async def init_pg() -> None:
         )
         """)
         await conn.execute("""
+        ALTER TABLE ratings
+        ADD COLUMN IF NOT EXISTS rated_at TIMESTAMPTZ
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ratings_rated_at
+        ON ratings (user_id, album_list, rated_at)
+        """)
+        await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_ratings_user
         ON ratings (user_id, album_list)
         """)
@@ -331,15 +339,16 @@ async def get_user_rating(user_id: int, album_list: str, rank: int) -> Optional[
         return int(row["rating"]) if row else None
 
 async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -> None:
+    now = datetime.now(timezone.utc)
     async with _pool().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO ratings (user_id, album_list, rank, rating)
-            VALUES ($1,$2,$3,$4)
+            INSERT INTO ratings (user_id, album_list, rank, rating, rated_at)
+            VALUES ($1,$2,$3,$4,$5)
             ON CONFLICT (user_id, album_list, rank)
-            DO UPDATE SET rating=EXCLUDED.rating
+            DO UPDATE SET rating=EXCLUDED.rating, rated_at=EXCLUDED.rated_at
             """,
-            user_id, album_list, rank, rating
+            user_id, album_list, rank, rating, now
         )
 
 # ================= UI =================
@@ -519,13 +528,155 @@ async def start(msg: Message):
         await msg.reply("Напиши мне в личные сообщения 🙂")
         return
 
-    await init_http()
-    await get_user(msg.from_user.id)
-    await send_album_post(msg.from_user.id)
+    text = """Привет!
+
+Команды:
+/start_albums — начать смотреть альбомы
+/menu — меню
+/stats — статистика
+/next — пропустить
+/prev — предыдущий альбом
+/reset — сначала списка
+/current — показать текущий ещё раз
+/my_ratings — последние оценки
+/export_ratings — выгрузить оценки в CSV
+"""
+    await msg.answer(text, reply_markup=menu_keyboard())
+
 
 @router.message(Command("menu"))
 async def menu_cmd(msg: Message):
     await msg.answer("📋 Меню", reply_markup=menu_keyboard())
+
+
+@router.message(Command("start_albums"))
+async def start_albums(msg: Message):
+    if msg.chat.type != "private":
+        await msg.reply("Напиши мне в личные сообщения 🙂")
+        return
+    await init_http()
+    await get_user(msg.from_user.id)
+    await send_album_post(msg.from_user.id)
+
+
+@router.message(Command("stats"))
+async def stats_cmd(msg: Message):
+    txt = await build_stats_text(msg.from_user.id)
+    await msg.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
+
+
+@router.message(Command("next"))
+async def next_cmd(msg: Message):
+    album_list, idx = await get_user(msg.from_user.id)
+    await set_index(msg.from_user.id, idx - 1)
+    await send_album_post(msg.from_user.id)
+
+
+@router.message(Command("prev"))
+async def prev_cmd(msg: Message):
+    album_list, idx = await get_user(msg.from_user.id)
+    await set_index(msg.from_user.id, idx + 1)
+    await send_album_post(msg.from_user.id)
+
+
+@router.message(Command("reset"))
+async def reset_cmd(msg: Message):
+    album_list, _ = await get_user(msg.from_user.id)
+    albums = get_albums(album_list)
+    await set_index(msg.from_user.id, len(albums) - 1)
+    await msg.answer("Сброшено на начало списка.")
+    await send_album_post(msg.from_user.id)
+
+
+@router.message(Command("current"))
+async def current_cmd(msg: Message):
+    await send_album_post(msg.from_user.id)
+
+
+async def recent_ratings_text(user_id: int, limit: int = 10) -> str:
+    album_list, _ = await get_user(user_id)
+    albums = get_albums(album_list)
+    by_rank = {int(r["rank"]): r for _, r in albums.iterrows()}
+
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT rank, rating, rated_at
+            FROM ratings
+            WHERE user_id=$1 AND album_list=$2
+            ORDER BY rated_at DESC NULLS LAST, rank DESC
+            LIMIT $3
+            """,
+            user_id, album_list, limit
+        )
+
+    if not rows:
+        return "Пока нет оценок."
+
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        rank = int(r["rank"])
+        rating = int(r["rating"])
+        item = by_rank.get(rank)
+        if item is not None:
+            artist = str(item["artist"])
+            album = str(item["album"])
+            title = f"#{rank} {artist} — {album}"
+        else:
+            title = f"#{rank}"
+        lines.append(f"{i}. {title} — {rating}/5")
+
+    return "🧾 <b>Последние оценки</b>\n\n" + "\n".join(lines)
+
+
+@router.message(Command("my_ratings"))
+async def my_ratings_cmd(msg: Message):
+    txt = await recent_ratings_text(msg.from_user.id, limit=10)
+    await msg.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
+
+
+@router.message(Command("export_ratings"))
+async def export_ratings_cmd(msg: Message):
+    user_id = msg.from_user.id
+    album_list, _ = await get_user(user_id)
+    albums = get_albums(album_list)
+    by_rank = {int(r["rank"]): r for _, r in albums.iterrows()}
+
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT rank, rating, rated_at
+            FROM ratings
+            WHERE user_id=$1 AND album_list=$2
+            ORDER BY rank
+            """,
+            user_id, album_list
+        )
+
+    if not rows:
+        await msg.answer("Пока нет оценок для выгрузки.")
+        return
+
+    import csv
+    import io
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["album_list", "rank", "artist", "album", "rating", "rated_at"])
+
+    for r in rows:
+        rank = int(r["rank"])
+        rating = int(r["rating"])
+        rated_at = r["rated_at"].isoformat() if r["rated_at"] else ""
+        item = by_rank.get(rank)
+        artist = str(item["artist"]) if item is not None else ""
+        album = str(item["album"]) if item is not None else ""
+        w.writerow([album_list, rank, artist, album, rating, rated_at])
+
+    data = buf.getvalue().encode("utf-8")
+    file = BufferedInputFile(data, filename=f"ratings_{album_list}.csv")
+    await bot.send_document(user_id, document=file, caption="Ваши оценки в CSV.")
+
 
 @router.callback_query(F.data.startswith("nav:"))
 async def nav_cb(call: CallbackQuery):
