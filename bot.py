@@ -1,12 +1,14 @@
 import os
 import asyncio
-import sqlite3
 import pandas as pd
 import aiohttp
 from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncpg
@@ -27,13 +29,13 @@ if not Config.DATABASE_URL:
 
 # ================= GLOBALS =================
 
-bot = Bot(token=Config.TOKEN)
+bot = Bot(Config.TOKEN)
 dp = Dispatcher()
 router = Router()
 scheduler = AsyncIOScheduler()
 pg_pool: asyncpg.Pool | None = None
 
-# ================= POSTGRES =================
+# ================= DATABASE =================
 
 async def init_pg():
     global pg_pool
@@ -60,11 +62,11 @@ async def init_pg():
         )
         """)
 
-# ================= ALBUM LISTS =================
+# ================= ALBUMS =================
 
 album_cache = {}
 
-def load_albums(list_name: str):
+def load_albums(list_name):
     df = pd.read_excel(f"{Config.ALBUMS_DIR}/{list_name}.xlsx")
     return df.sort_values("rank").reset_index(drop=True)
 
@@ -75,28 +77,50 @@ def get_albums(list_name):
 
 # ================= USERS =================
 
-async def get_user(user_id: int):
+async def get_user(user_id):
     async with pg_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT album_list, current_index, daily, paused FROM users WHERE user_id=$1",
             user_id
         )
-        if row is None:
+
+        if not row:
             albums = get_albums(Config.DEFAULT_LIST)
-            start_index = len(albums) - 1
+            index = len(albums) - 1
             await conn.execute(
                 "INSERT INTO users VALUES ($1,$2,$3,0,0)",
-                user_id, Config.DEFAULT_LIST, start_index
+                user_id, Config.DEFAULT_LIST, index
             )
-            return Config.DEFAULT_LIST, start_index, 0, 0
+            return Config.DEFAULT_LIST, index, 0, 0
+
         return row["album_list"], row["current_index"], row["daily"], row["paused"]
 
-async def update_index(user_id, index):
+async def set_index(user_id, index):
     async with pg_pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET current_index=$1 WHERE user_id=$2",
             index, user_id
         )
+
+# ================= COVERS =================
+
+async def get_cover_and_year(artist, album):
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(
+                "https://itunes.apple.com/search",
+                params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
+                timeout=10
+            ) as r:
+                data = await r.json(content_type=None)
+                if data.get("resultCount"):
+                    item = data["results"][0]
+                    cover = item["artworkUrl100"].replace("100x100", "600x600")
+                    year = item.get("releaseDate", "")[:4]
+                    return cover, year
+        except:
+            pass
+    return None, None
 
 # ================= UI =================
 
@@ -104,32 +128,41 @@ def google_album_link(artist, album):
     q = quote_plus(f"{artist} {album}")
     return f"https://www.google.com/search?q={q}"
 
+def album_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("🎧 Найти альбом", callback_data="search")],
+        [
+            InlineKeyboardButton("⬅️ Назад", callback_data="prev"),
+            InlineKeyboardButton("➡️ Далее", callback_data="next")
+        ],
+        [
+            InlineKeyboardButton("⭐ Оценить", callback_data="rate_menu"),
+            InlineKeyboardButton("📋 Меню", callback_data="menu")
+        ]
+    ])
+
 def rating_keyboard():
     kb = InlineKeyboardMarkup(row_width=5)
     for i in range(1, 6):
-        kb.insert(InlineKeyboardButton(text=f"⭐ {i}", callback_data=f"rate:{i}"))
+        kb.insert(
+            InlineKeyboardButton(f"⭐ {i}", callback_data=f"rate:{i}")
+        )
     return kb
 
-def album_keyboard(artist, album):
+def menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎧 Найти альбом", url=google_album_link(artist, album))],
-        [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="prev"),
-            InlineKeyboardButton(text="➡️ Далее", callback_data="next")
-        ],
-        [InlineKeyboardButton(text="⭐ Оценить", callback_data="rate_menu")]
+        [InlineKeyboardButton("▶️ Продолжить", callback_data="menu_resume")],
+        [InlineKeyboardButton("⏸ Пауза", callback_data="menu_pause")]
     ])
 
 # ================= CORE =================
 
-async def send_album(user_id, step=0):
+async def show_album(user_id):
     album_list, index, _, paused = await get_user(user_id)
     if paused:
         return
 
     albums = get_albums(album_list)
-    index = index + step
-
     if index < 0 or index >= len(albums):
         await bot.send_message(user_id, "📭 Альбомы закончились")
         return
@@ -137,21 +170,22 @@ async def send_album(user_id, step=0):
     row = albums.iloc[index]
     artist, album, genre, rank = row["artist"], row["album"], row["genre"], row["rank"]
 
+    cover, year = await get_cover_and_year(artist, album)
+
     caption = (
         f"🏆 <b>#{rank}</b>\n"
         f"🎤 <b>{artist}</b>\n"
         f"💿 <b>{album}</b>\n"
+        f"📅 {year or '—'}\n"
         f"🎧 {genre}"
     )
 
-    await bot.send_message(
-        user_id,
-        caption,
-        parse_mode="HTML",
-        reply_markup=album_keyboard(artist, album)
-    )
-
-    await update_index(user_id, index)
+    if cover:
+        await bot.send_photo(user_id, cover, caption=caption,
+                             parse_mode="HTML", reply_markup=album_keyboard())
+    else:
+        await bot.send_message(user_id, caption,
+                               parse_mode="HTML", reply_markup=album_keyboard())
 
 # ================= HANDLERS =================
 
@@ -161,17 +195,21 @@ async def start(message: Message):
         await message.reply("Напиши мне в личные сообщения 🙂")
         return
     await get_user(message.from_user.id)
-    await send_album(message.from_user.id)
+    await show_album(message.from_user.id)
 
 @router.callback_query(F.data == "next")
 async def next_album(call: CallbackQuery):
+    album_list, index, *_ = await get_user(call.from_user.id)
+    await set_index(call.from_user.id, index - 1)
     await call.answer()
-    await send_album(call.from_user.id, -1)
+    await show_album(call.from_user.id)
 
 @router.callback_query(F.data == "prev")
 async def prev_album(call: CallbackQuery):
+    album_list, index, *_ = await get_user(call.from_user.id)
+    await set_index(call.from_user.id, index + 1)
     await call.answer()
-    await send_album(call.from_user.id, 1)
+    await show_album(call.from_user.id)
 
 @router.callback_query(F.data == "rate_menu")
 async def rate_menu(call: CallbackQuery):
@@ -180,7 +218,7 @@ async def rate_menu(call: CallbackQuery):
 @router.callback_query(F.data.startswith("rate:"))
 async def rate_album(call: CallbackQuery):
     rating = int(call.data.split(":")[1])
-    album_list, index, _, _ = await get_user(call.from_user.id)
+    album_list, index, *_ = await get_user(call.from_user.id)
     albums = get_albums(album_list)
     rank = albums.iloc[index]["rank"]
 
@@ -193,14 +231,26 @@ async def rate_album(call: CallbackQuery):
 
     await call.answer(f"⭐ {rating} сохранено")
 
-# ================= STARTUP =================
+@router.callback_query(F.data == "search")
+async def search_album(call: CallbackQuery):
+    album_list, index, *_ = await get_user(call.from_user.id)
+    row = get_albums(album_list).iloc[index]
+    url = google_album_link(row["artist"], row["album"])
+    await call.message.answer(url)
+    await call.answer()
+
+@router.callback_query(F.data == "menu")
+async def menu(call: CallbackQuery):
+    await call.message.answer("📋 Меню", reply_markup=menu_keyboard())
+    await call.answer()
+
+# ================= START =================
 
 async def main():
     await init_pg()
     dp.include_router(router)
-
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
