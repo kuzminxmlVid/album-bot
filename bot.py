@@ -16,6 +16,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BufferedInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
 
@@ -176,6 +177,40 @@ def _http() -> aiohttp.ClientSession:
 
 def _mb_headers() -> Dict[str, str]:
     return {"User-Agent": f"{Config.MB_APP} ({Config.MB_CONTACT})"}
+
+# ================= COVER DOWNLOAD (Telegram-safe) =================
+
+async def fetch_image_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
+    """
+    Telegram иногда не может забрать картинку по URL напрямую.
+    Тогда мы скачиваем её сами и отправляем как файл.
+
+    Returns: (bytes, file_ext) or (None, None)
+    """
+    try:
+        s = _http()
+        async with s.get(url, allow_redirects=True) as r:
+            if r.status != 200:
+                return None, None
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if not ctype.startswith("image/"):
+                return None, None
+            data = await r.read()
+            # Telegram лимит для sendPhoto сейчас большой, но лучше держаться в разумных пределах
+            if not data or len(data) > 9_500_000:
+                return None, None
+            ext = "jpg"
+            if "png" in ctype:
+                ext = "png"
+            elif "webp" in ctype:
+                ext = "webp"
+            elif "jpeg" in ctype or "jpg" in ctype:
+                ext = "jpg"
+            return data, ext
+    except Exception as e:
+        log.debug("fetch_image_bytes failed: %s", e)
+        return None, None
+
 
 # ================= COVER CACHE =================
 
@@ -386,19 +421,36 @@ async def send_album_post(user_id: int) -> None:
         return
 
     if cover:
+        # 1) Fast path: let Telegram fetch URL itself
         try:
             await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=kb)
             return
         except TelegramBadRequest as e:
             # Telegram не смог скачать картинку по URL (часто из-за временных проблем или блокировок хоста)
-            log.warning("Telegram cannot fetch cover URL (list=%s rank=%s url=%s): %s", album_list, rank, cover, e)
-            # Убираем кэш, чтобы в следующий раз попробовать другой источник
-            await delete_cached_cover(album_list, rank)
-            # Фоллбек: отправим без фото, чтобы бот не падал
+            log.warning(
+                "Telegram cannot fetch cover URL (list=%s rank=%s url=%s): %s",
+                album_list, rank, cover, e
+            )
+
+        # 2) Fallback: download ourselves and send as file
+        data, ext = await fetch_image_bytes(cover)
+        if data:
+            try:
+                photo = BufferedInputFile(data, filename=f"cover.{ext or 'jpg'}")
+                await bot.send_photo(user_id, photo, caption=caption, parse_mode="HTML", reply_markup=kb)
+                return
+            except TelegramBadRequest as e:
+                log.warning("Telegram cannot send downloaded cover (list=%s rank=%s): %s", album_list, rank, e)
+
+        # If cover failed, clear cache so next time we can try another source
+        await delete_cached_cover(album_list, rank)
+
+    # Final fallback: text-only post
     await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=kb)
 
 
 async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, rank: int, rating: int) -> None:
+(call: CallbackQuery, album_list: str, rank: int, rating: int) -> None:
     albums = get_albums(album_list)
     row = albums.loc[albums["rank"] == rank]
     if row.empty:
