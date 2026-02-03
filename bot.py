@@ -450,7 +450,6 @@ async def send_album_post(user_id: int) -> None:
 
 
 async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, rank: int, rating: int) -> None:
-(call: CallbackQuery, album_list: str, rank: int, rating: int) -> None:
     albums = get_albums(album_list)
     row = albums.loc[albums["rank"] == rank]
     if row.empty:
