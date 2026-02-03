@@ -24,7 +24,7 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramBadRequest
 
-# ---------------- LOGGING ----------------
+# ================= LOGGING =================
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("album_bot")
 
-# ---------------- CONFIG ----------------
+# ================= CONFIG =================
 
 class Config:
     TOKEN = os.getenv("TOKEN")
@@ -42,9 +42,11 @@ class Config:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     ALBUMS_DIR = os.getenv("ALBUMS_DIR", os.path.join(BASE_DIR, "albums"))
 
+    # MusicBrainz requires contact in User-Agent (email or site)
     MB_CONTACT = os.getenv("MB_CONTACT", "contact:not_set")
     MB_APP = os.getenv("MB_APP", "MusicAlbumClubBot/1.0")
 
+    # Album of the day schedule
     DAILY_TZ = os.getenv("DAILY_TZ", "Europe/Berlin")
     DAILY_HOUR = int(os.getenv("DAILY_HOUR", "10"))
     DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
@@ -55,7 +57,7 @@ if not Config.TOKEN or not Config.DATABASE_URL:
 if Config.DATABASE_URL.startswith("postgres://"):
     Config.DATABASE_URL = Config.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# ---------------- BOT ----------------
+# ================= BOT =================
 
 bot = Bot(token=Config.TOKEN)
 dp = Dispatcher()
@@ -65,7 +67,7 @@ pg_pool: Optional[asyncpg.Pool] = None
 http_session: Optional[aiohttp.ClientSession] = None
 daily_task: Optional[asyncio.Task] = None
 
-# ---------------- DB ----------------
+# ================= DATABASE =================
 
 def _pool() -> asyncpg.Pool:
     if pg_pool is None:
@@ -84,14 +86,27 @@ async def init_pg() -> None:
         )
         """)
 
+        # progress per (user, list)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_progress (
             user_id BIGINT NOT NULL,
             album_list TEXT NOT NULL,
             current_index INTEGER NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (user_id, album_list)
         )
         """)
+
+        # IMPORTANT: older DBs may already have updated_at NOT NULL without default.
+        # Make it safe for inserts even if some code inserts without updated_at.
+        try:
+            await conn.execute("ALTER TABLE user_progress ALTER COLUMN updated_at SET DEFAULT NOW()")
+        except Exception:
+            pass
+        try:
+            await conn.execute("UPDATE user_progress SET updated_at=NOW() WHERE updated_at IS NULL")
+        except Exception:
+            pass
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS ratings (
@@ -118,11 +133,13 @@ async def init_pg() -> None:
             PRIMARY KEY (album_list, rank)
         )
         """)
-        await conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_covers_updated
-        ON covers (updated_at)
-        """)
 
+        try:
+            await conn.execute("ALTER TABLE covers ALTER COLUMN updated_at SET DEFAULT NOW()")
+        except Exception:
+            pass
+
+        # daily subscription
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_subscriptions (
             user_id BIGINT PRIMARY KEY,
@@ -135,18 +152,16 @@ async def init_pg() -> None:
         )
         """)
 
-# ---------------- LISTS ----------------
-
-album_cache: Dict[str, pd.DataFrame] = {}
+# ================= LIST NAMES =================
 
 def canonical_list_name(name: str) -> str:
     s = (name or "").strip()
-    s = unquote_plus(s)           # декодит и %20 и +
+    s = unquote_plus(s)
     s = re.sub(r"\s+", " ", s)
     return s
 
 def encode_list_name(name: str) -> str:
-    return quote(canonical_list_name(name), safe="")  # в callback_data
+    return quote(canonical_list_name(name), safe="")
 
 def list_file_names() -> List[str]:
     if not os.path.isdir(Config.ALBUMS_DIR):
@@ -163,6 +178,10 @@ def resolve_list_name(name: str) -> Optional[str]:
         if canonical_list_name(n).lower() == target:
             return n
     return None
+
+# ================= ALBUMS =================
+
+album_cache: Dict[str, pd.DataFrame] = {}
 
 def load_albums(list_name: str) -> pd.DataFrame:
     path = os.path.join(Config.ALBUMS_DIR, f"{list_name}.xlsx")
@@ -189,7 +208,7 @@ def get_albums(list_name: str) -> pd.DataFrame:
         album_cache[list_name] = load_albums(list_name)
     return album_cache[list_name]
 
-# ---------------- USERS + PROGRESS ----------------
+# ================= USERS + PROGRESS =================
 
 async def ensure_user(user_id: int) -> str:
     async with _pool().acquire() as conn:
@@ -201,10 +220,12 @@ async def ensure_user(user_id: int) -> str:
         await conn.execute("INSERT INTO users (user_id, album_list) VALUES ($1,$2)", user_id, default_disk)
 
         albums = get_albums(default_disk)
+        idx = len(albums) - 1
+        now = datetime.now(timezone.utc)
         await conn.execute(
-            "INSERT INTO user_progress (user_id, album_list, current_index) VALUES ($1,$2,$3) "
+            "INSERT INTO user_progress (user_id, album_list, current_index, updated_at) VALUES ($1,$2,$3,$4) "
             "ON CONFLICT (user_id, album_list) DO NOTHING",
-            user_id, default_disk, len(albums) - 1
+            user_id, default_disk, idx, now
         )
         return default_disk
 
@@ -218,10 +239,12 @@ async def set_selected_list(user_id: int, list_name: str) -> str:
     async with _pool().acquire() as conn:
         await conn.execute("UPDATE users SET album_list=$1 WHERE user_id=$2", resolved, user_id)
         albums = get_albums(resolved)
+        idx = len(albums) - 1
+        now = datetime.now(timezone.utc)
         await conn.execute(
-            "INSERT INTO user_progress (user_id, album_list, current_index) VALUES ($1,$2,$3) "
+            "INSERT INTO user_progress (user_id, album_list, current_index, updated_at) VALUES ($1,$2,$3,$4) "
             "ON CONFLICT (user_id, album_list) DO NOTHING",
-            user_id, resolved, len(albums) - 1
+            user_id, resolved, idx, now
         )
     return resolved
 
@@ -235,22 +258,24 @@ async def get_index(user_id: int, list_name: str) -> int:
             return int(row["current_index"])
         albums = get_albums(list_name)
         idx = len(albums) - 1
+        now = datetime.now(timezone.utc)
         await conn.execute(
-            "INSERT INTO user_progress (user_id, album_list, current_index) VALUES ($1,$2,$3) "
-            "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index",
-            user_id, list_name, idx
+            "INSERT INTO user_progress (user_id, album_list, current_index, updated_at) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index, updated_at=EXCLUDED.updated_at",
+            user_id, list_name, idx, now
         )
         return idx
 
 async def set_index(user_id: int, list_name: str, idx: int) -> None:
+    now = datetime.now(timezone.utc)
     async with _pool().acquire() as conn:
         await conn.execute(
-            "INSERT INTO user_progress (user_id, album_list, current_index) VALUES ($1,$2,$3) "
-            "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index",
-            user_id, list_name, idx
+            "INSERT INTO user_progress (user_id, album_list, current_index, updated_at) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index, updated_at=EXCLUDED.updated_at",
+            user_id, list_name, idx, now
         )
 
-# ---------------- HTTP ----------------
+# ================= HTTP =================
 
 async def init_http() -> None:
     global http_session
@@ -286,7 +311,7 @@ async def fetch_image_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
         log.debug("fetch_image_bytes failed: %s", e)
         return None, None
 
-# ---------------- COVERS CACHE + SOURCES ----------------
+# ================= COVER CACHE + SOURCES =================
 
 async def get_cached_cover(album_list: str, rank: int) -> Optional[str]:
     async with _pool().acquire() as conn:
@@ -389,7 +414,7 @@ async def get_cover_with_fallback(album_list: str, rank: int, artist: str, album
 
     return None
 
-# ---------------- RATINGS ----------------
+# ================= RATINGS =================
 
 async def get_user_rating(user_id: int, album_list: str, rank: int) -> Optional[int]:
     async with _pool().acquire() as conn:
@@ -411,20 +436,19 @@ async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -
             user_id, album_list, rank, rating
         )
 
-# ---------------- UI ----------------
+# ================= UI =================
 
 def google_link(artist: str, album: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
-def album_caption(row: pd.Series, user_rating: Optional[int], prefix: str = "") -> str:
-    genre = str(row.get("genre", "") or "")
+def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: Optional[int], prefix: str = "") -> str:
     rating_line = f"\n\n⭐ <b>Ваша оценка:</b> {user_rating}/5" if user_rating else ""
     header = (prefix + "\n\n") if prefix else ""
     return (
         header +
-        f"🏆 <b>#{int(row['rank'])}</b>\n"
-        f"🎤 <b>{row['artist']}</b>\n"
-        f"💿 <b>{row['album']}</b>\n"
+        f"🏆 <b>#{rank}</b>\n"
+        f"🎤 <b>{artist}</b>\n"
+        f"💿 <b>{album}</b>\n"
         f"🎧 {genre}"
         f"{rating_line}"
     )
@@ -470,26 +494,27 @@ def lists_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="ui:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ---------------- CORE SEND/EDIT ----------------
+# ================= CORE =================
 
 async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix: str = ""):
     albums = get_albums(album_list)
     if idx < 0 or idx >= len(albums):
-        return None, "📭 Альбомы закончились", InlineKeyboardMarkup(inline_keyboard=[]), -1, None, "", ""
+        return None, "📭 Альбомы закончились", InlineKeyboardMarkup(inline_keyboard=[]), -1, None, "", "", ""
 
     row = albums.iloc[idx]
     rank = int(row["rank"])
     artist = str(row["artist"])
     album = str(row["album"])
-    user_rating = await get_user_rating(user_id, album_list, rank)
+    genre = str(row.get("genre", "") or "")
 
+    user_rating = await get_user_rating(user_id, album_list, rank)
     cover = await get_cover_with_fallback(album_list, rank, artist, album)
-    caption = album_caption(row, user_rating, prefix=prefix)
+    caption = album_caption(rank, artist, album, genre, user_rating, prefix=prefix)
     kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx)
-    return cover, caption, kb, rank, user_rating, artist, album
+    return cover, caption, kb, rank, user_rating, artist, album, genre
 
 async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "flow", prefix: str = "") -> None:
-    cover, caption, kb, rank, _, _, _ = await render_album(user_id, album_list, idx, ctx=ctx, prefix=prefix)
+    cover, caption, kb, rank, _, _, _, _ = await render_album(user_id, album_list, idx, ctx=ctx, prefix=prefix)
     if caption.startswith("📭"):
         await bot.send_message(user_id, caption)
         return
@@ -498,8 +523,8 @@ async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "f
         try:
             await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=kb)
             return
-        except TelegramBadRequest:
-            pass
+        except TelegramBadRequest as e:
+            log.warning("Telegram cannot fetch cover URL (list=%s rank=%s): %s", album_list, rank, e)
 
         data, ext = await fetch_image_bytes(cover)
         if data:
@@ -507,8 +532,8 @@ async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "f
                 photo = BufferedInputFile(data, filename=f"cover.{ext or 'jpg'}")
                 await bot.send_photo(user_id, photo, caption=caption, parse_mode="HTML", reply_markup=kb)
                 return
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as e:
+                log.warning("Telegram cannot send downloaded cover (list=%s rank=%s): %s", album_list, rank, e)
 
         await delete_cached_cover(album_list, rank)
 
@@ -516,13 +541,16 @@ async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "f
 
 async def edit_album_post(call: CallbackQuery, album_list: str, rank: int, ctx: str, prefix: str = "") -> None:
     albums = get_albums(album_list)
-    row = albums.loc[albums["rank"] == rank]
-    if row.empty:
+    rows = albums.loc[albums["rank"] == rank]
+    if rows.empty:
         return
-    row = row.iloc[0]
-    ur = await get_user_rating(call.from_user.id, album_list, rank)
-    caption = album_caption(row, ur, prefix=prefix)
-    kb = album_keyboard(album_list, rank, str(row["artist"]), str(row["album"]), ur, ctx)
+    row = rows.iloc[0]
+    artist = str(row["artist"])
+    album = str(row["album"])
+    genre = str(row.get("genre", "") or "")
+    user_rating = await get_user_rating(call.from_user.id, album_list, rank)
+    caption = album_caption(rank, artist, album, genre, user_rating, prefix=prefix)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx)
 
     try:
         if call.message.photo:
@@ -532,7 +560,7 @@ async def edit_album_post(call: CallbackQuery, album_list: str, rank: int, ctx: 
     except Exception as e:
         log.debug("edit album post failed: %s", e)
 
-# ---------------- STATS / EXPORT ----------------
+# ================= STATS / EXPORT =================
 
 async def build_stats_text(user_id: int) -> str:
     album_list = await get_selected_list(user_id)
@@ -562,27 +590,6 @@ async def build_stats_text(user_id: int) -> str:
         f"Распределение оценок:\n" + "\n".join(lines)
     )
 
-async def last_ratings_text(user_id: int, limit: int = 10) -> str:
-    async with _pool().acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT album_list, rank, rating, rated_at
-            FROM ratings
-            WHERE user_id=$1
-            ORDER BY rated_at DESC
-            LIMIT $2
-            """,
-            user_id, limit
-        )
-    if not rows:
-        return "Пока нет оценок."
-    tz = ZoneInfo(Config.DAILY_TZ)
-    lines = []
-    for r in rows:
-        ts = r["rated_at"].astimezone(tz).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"{ts} — {r['album_list']} #{r['rank']}: {r['rating']}/5")
-    return "🧾 <b>Последние оценки</b>\n\n" + "\n".join(lines)
-
 async def export_ratings_csv(user_id: int) -> bytes:
     async with _pool().acquire() as conn:
         rows = await conn.fetch(
@@ -596,7 +603,7 @@ async def export_ratings_csv(user_id: int) -> bytes:
         w.writerow([r["album_list"], r["rank"], r["rating"], r["rated_at"].isoformat()])
     return buf.getvalue().encode("utf-8")
 
-# ---------------- DAILY ALBUM ----------------
+# ================= DAILY ALBUM =================
 
 async def toggle_daily(user_id: int) -> bool:
     album_list = await get_selected_list(user_id)
@@ -668,7 +675,7 @@ async def daily_loop() -> None:
             log.exception("daily loop crashed")
             await asyncio.sleep(5)
 
-# ---------------- ERROR HANDLER ----------------
+# ================= ERROR HANDLER =================
 
 @router.errors()
 async def on_error(event):
@@ -676,32 +683,31 @@ async def on_error(event):
     if exc:
         log.exception("Unhandled error", exc_info=exc)
     else:
-        log.exception("Unhandled error (no exception in event)")
+        log.exception("Unhandled error (no exception)")
     return True
 
-# ---------------- COMMANDS ----------------
+# ================= COMMANDS =================
 
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
     if msg.chat.type != "private":
-        await msg.reply("Напиши мне в личные сообщения 🙂")
+        await msg.reply("Напиши мне в личку 🙂")
         return
     await init_http()
     await ensure_user(msg.from_user.id)
     text = (
         "Привет.\n\n"
-        "Начать альбомы: /start_albums\n"
+        "Начать: /start_albums\n"
         "Меню: /menu\n"
         "Списки: /lists\n"
         "Статистика: /stats\n"
-        "Альбом дня включается кнопкой в меню."
     )
     await msg.answer(text, reply_markup=menu_keyboard())
 
 @router.message(Command("start_albums"))
 async def cmd_start_albums(msg: Message):
     if msg.chat.type != "private":
-        await msg.reply("Напиши мне в личные сообщения 🙂")
+        await msg.reply("Напиши мне в личку 🙂")
         return
     await init_http()
     album_list = await ensure_user(msg.from_user.id)
@@ -719,10 +725,6 @@ async def cmd_stats(msg: Message):
 
 @router.message(Command("lists"))
 async def cmd_lists(msg: Message):
-    items = list_file_names()
-    if not items:
-        await msg.answer("📚 Списков не найдено. Положи .xlsx в папку albums.")
-        return
     await msg.answer("📚 Выбери список", reply_markup=lists_keyboard())
 
 @router.message(Command("set_list"))
@@ -740,31 +742,12 @@ async def cmd_set_list(msg: Message):
     await msg.answer(f"Ок. Список: {resolved}")
     await send_album_post(msg.from_user.id, resolved, idx, ctx="flow")
 
-@router.message(Command("next_from"))
-async def cmd_next_from(msg: Message):
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await msg.answer("Напиши так: /next_from top500 RS")
-        return
-    resolved = resolve_list_name(parts[1])
-    if not resolved:
-        await msg.answer("Не нашёл такой список. Набери /lists", reply_markup=lists_keyboard())
-        return
-    idx = await get_index(msg.from_user.id, resolved)
-    await send_album_post(msg.from_user.id, resolved, idx, ctx="daily", prefix=f"↪️ Из другого списка: <b>{resolved}</b>")
-    await set_index(msg.from_user.id, resolved, idx - 1)
-
-@router.message(Command("my_ratings"))
-async def cmd_my_ratings(msg: Message):
-    txt = await last_ratings_text(msg.from_user.id, limit=10)
-    await msg.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
-
 @router.message(Command("export_ratings"))
 async def cmd_export(msg: Message):
     data = await export_ratings_csv(msg.from_user.id)
     await msg.answer_document(BufferedInputFile(data, filename="ratings.csv"))
 
-# ---------------- CALLBACKS ----------------
+# ================= CALLBACKS =================
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(call: CallbackQuery):
@@ -854,13 +837,16 @@ async def rate_ui(call: CallbackQuery):
     ctx = parts[4]
 
     albums = get_albums(album_list)
-    row = albums.loc[albums["rank"] == rank]
-    if row.empty:
+    rows = albums.loc[albums["rank"] == rank]
+    if rows.empty:
         await call.answer("Альбом не найден", show_alert=True)
         return
-    row = row.iloc[0]
+    row = rows.iloc[0]
+    artist = str(row["artist"])
+    album = str(row["album"])
+    genre = str(row.get("genre", "") or "")
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
-    caption = album_caption(row, current_rating)
+    caption = album_caption(rank, artist, album, genre, current_rating)
 
     await call.answer()
     try:
@@ -878,6 +864,7 @@ async def rate_ui(call: CallbackQuery):
             )
     except Exception as e:
         log.debug("rate ui edit failed: %s", e)
+        await bot.send_message(call.from_user.id, "Оцени альбом:", reply_markup=rating_keyboard(album_list, rank, ctx))
 
 @router.callback_query(F.data.startswith("rate:"))
 async def rate_set(call: CallbackQuery):
@@ -885,6 +872,7 @@ async def rate_set(call: CallbackQuery):
     if len(parts) != 5:
         await call.answer("Ошибка кнопки", show_alert=True)
         return
+
     rating = int(parts[1])
     album_list = canonical_list_name(parts[2])
     album_list = resolve_list_name(album_list) or album_list
@@ -896,7 +884,7 @@ async def rate_set(call: CallbackQuery):
 
     await edit_album_post(call, album_list, rank, ctx)
 
-    # только в основном потоке и только если оценили текущий альбом
+    # Only auto-advance in main flow
     if ctx == "flow":
         idx = await get_index(call.from_user.id, album_list)
         albums = get_albums(album_list)
@@ -917,7 +905,7 @@ async def back(call: CallbackQuery):
     await call.answer()
     await edit_album_post(call, album_list, rank, ctx)
 
-# ---------------- START / SHUTDOWN ----------------
+# ================= START / SHUTDOWN =================
 
 async def on_shutdown() -> None:
     global http_session, daily_task
@@ -936,8 +924,8 @@ async def main():
     global daily_task
     await init_pg()
     await init_http()
-    dp.include_router(router)
 
+    dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
 
     daily_task = asyncio.create_task(daily_loop())
