@@ -1,44 +1,95 @@
-# UPDATED TELEGRAM BOT
-# Variant B: iTunes -> Deezer fallback for album covers
-# + /menu command with navigation
+# TELEGRAM BOT (aiogram 3 + PostgreSQL)
+# - UX unchanged
+# - PostgreSQL storage
+# - automatic migration from old SQLite users.db
+# - ratings, menus, lists, groups supported
 
 import os
+import asyncio
 import sqlite3
 import pandas as pd
 import aiohttp
 from urllib.parse import quote_plus
 
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+import asyncpg
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
+
 if not TOKEN:
-    raise RuntimeError("TOKEN не задан в переменных окружения")
+    raise RuntimeError("TOKEN not set")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
 
 ALBUMS_DIR = "albums"
 DEFAULT_LIST = os.getenv("ALBUM_LIST", "top100")
 
 # ---------------- BOT ----------------
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# ---------------- DB ----------------
-conn = sqlite3.connect("users.db", check_same_thread=False)
-cursor = conn.cursor()
+# ---------------- POSTGRES ----------------
+pg_pool: asyncpg.Pool | None = None
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    album_list TEXT,
-    current_index INTEGER,
-    daily INTEGER,
-    paused INTEGER
-)
-""")
-conn.commit()
+async def init_pg():
+    global pg_pool
+    pg_pool = await asyncpg.create_pool(DATABASE_URL)
+
+    async with pg_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            album_list TEXT,
+            current_index INTEGER,
+            daily INTEGER,
+            paused INTEGER
+        )
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS ratings (
+            user_id BIGINT,
+            album_list TEXT,
+            rank INTEGER,
+            rating INTEGER,
+            PRIMARY KEY (user_id, album_list, rank)
+        )
+        """)
+
+# ---------------- MIGRATION ----------------
+
+async def migrate_from_sqlite():
+    if not os.path.exists("users.db"):
+        return
+
+    sqlite_conn = sqlite3.connect("users.db")
+    sc = sqlite_conn.cursor()
+
+    async with pg_pool.acquire() as pg:
+        for row in sc.execute("SELECT user_id, album_list, current_index, daily, paused FROM users"):
+            await pg.execute(
+                "INSERT INTO users VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+                *row
+            )
+
+        try:
+            for row in sc.execute("SELECT user_id, album_list, rank, rating FROM ratings"):
+                await pg.execute(
+                    "INSERT INTO ratings VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                    *row
+                )
+        except sqlite3.OperationalError:
+            pass
+
+    sqlite_conn.close()
+    os.rename("users.db", "users.db.migrated")
 
 # ---------------- ALBUM LISTS ----------------
 
@@ -55,51 +106,68 @@ def get_albums(list_name):
 
 # ---------------- USERS ----------------
 
-def get_user(user_id):
-    cursor.execute(
-        "SELECT album_list, current_index, daily, paused FROM users WHERE user_id=?",
-        (user_id,)
-    )
-    row = cursor.fetchone()
-
-    if row is None:
-        albums = get_albums(DEFAULT_LIST)
-        start_index = len(albums) - 1
-        cursor.execute(
-            "INSERT INTO users VALUES (?, ?, ?, ?, ?)",
-            (user_id, DEFAULT_LIST, start_index, 0, 0)
+async def get_user(user_id: int):
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT album_list, current_index, daily, paused FROM users WHERE user_id=$1",
+            user_id
         )
-        conn.commit()
-        return DEFAULT_LIST, start_index, 0, 0
 
-    return row
+        if row is None:
+            albums = get_albums(DEFAULT_LIST)
+            start_index = len(albums) - 1
+            await conn.execute(
+                "INSERT INTO users VALUES ($1,$2,$3,0,0)",
+                user_id, DEFAULT_LIST, start_index
+            )
+            return DEFAULT_LIST, start_index, 0, 0
+
+        return row["album_list"], row["current_index"], row["daily"], row["paused"]
 
 
-def update_index(user_id, index):
-    cursor.execute(
-        "UPDATE users SET current_index=? WHERE user_id=?",
-        (index, user_id)
-    )
-    conn.commit()
+async def update_index(user_id, index):
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET current_index=$1 WHERE user_id=$2",
+            index, user_id
+        )
 
 
-def set_album_list(user_id, list_name):
+async def set_album_list(user_id, list_name):
     albums = get_albums(list_name)
-    cursor.execute(
-        "UPDATE users SET album_list=?, current_index=? WHERE user_id=?",
-        (list_name, len(albums) - 1, user_id)
-    )
-    conn.commit()
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET album_list=$1, current_index=$2 WHERE user_id=$3",
+            list_name, len(albums) - 1, user_id
+        )
 
 
-def set_paused(user_id, value):
-    cursor.execute(
-        "UPDATE users SET paused=? WHERE user_id=?",
-        (value, user_id)
-    )
-    conn.commit()
+async def set_paused(user_id, value):
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET paused=$1 WHERE user_id=$2",
+            value, user_id
+        )
 
-# ---------------- COVER PROVIDERS ----------------
+# ---------------- RATINGS ----------------
+
+async def set_rating(user_id, album_list, rank, rating):
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO ratings VALUES ($1,$2,$3,$4) ON CONFLICT (user_id,album_list,rank) DO UPDATE SET rating=$4",
+            user_id, album_list, rank, rating
+        )
+
+
+async def get_rating(user_id, album_list, rank):
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT rating FROM ratings WHERE user_id=$1 AND album_list=$2 AND rank=$3",
+            user_id, album_list, rank
+        )
+        return row["rating"] if row else None
+
+# ---------------- COVERS ----------------
 
 async def itunes_cover(session, artist, album):
     try:
@@ -107,7 +175,7 @@ async def itunes_cover(session, artist, album):
             "https://itunes.apple.com/search",
             params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=aiohttp.ClientTimeout(total=10)
+            timeout=10
         ) as r:
             if r.status != 200:
                 return None, None
@@ -131,7 +199,7 @@ async def deezer_cover(session, artist, album):
         async with session.get(
             "https://api.deezer.com/search/album",
             params={"q": f"{artist} {album}"},
-            timeout=aiohttp.ClientTimeout(total=10)
+            timeout=10
         ) as r:
             if r.status != 200:
                 return None
@@ -158,40 +226,44 @@ async def get_cover_and_year(session, artist, album):
 
 # ---------------- UI ----------------
 
-def artist_google_link(artist):
-    return f"https://www.google.com/search?q={quote_plus(artist)}"
+def google_album_link(artist, album):
+    return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
 
-def album_keyboard(artist):
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("🔎 Искать исполнителя", url=artist_google_link(artist)),
-        InlineKeyboardButton("➡️ Следующий альбом", callback_data="next"),
-        InlineKeyboardButton("📅 Альбом каждый день", callback_data="daily"),
-        InlineKeyboardButton("📋 Меню", callback_data="menu")
-    )
+def rating_keyboard(album_list, rank):
+    kb = InlineKeyboardMarkup(row_width=5)
+    for i in range(1, 6):
+        kb.insert(InlineKeyboardButton(text=str(i), callback_data=f"rate:{album_list}:{rank}:{i}"))
+    kb.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="menu"))
     return kb
+
+
+def album_keyboard(artist, album):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Найти альбом", url=google_album_link(artist, album))],
+        [InlineKeyboardButton(text="⭐ Оценить", callback_data="rate_menu")],
+        [InlineKeyboardButton(text="➡️ Следующий альбом", callback_data="next")],
+        [InlineKeyboardButton(text="📋 Меню", callback_data="menu")]
+    ])
 
 
 def menu_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("📚 Списки альбомов", callback_data="menu_lists"),
-        InlineKeyboardButton("▶️ Продолжить", callback_data="menu_resume"),
-        InlineKeyboardButton("⏸ Пауза", callback_data="menu_pause")
-    )
-    return kb
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📚 Списки альбомов", callback_data="menu_lists")],
+        [InlineKeyboardButton(text="▶️ Продолжить", callback_data="menu_resume")],
+        [InlineKeyboardButton(text="⏸ Пауза", callback_data="menu_pause")]
+    ])
 
 # ---------------- CORE ----------------
 
-async def send_album(user_id):
-    album_list, index, _, paused = get_user(user_id)
+async def send_album(chat_id, user_id):
+    album_list, index, _, paused = await get_user(user_id)
     if paused:
         return
 
     albums = get_albums(album_list)
     if index < 0:
-        await bot.send_message(user_id, "📭 Альбомы закончились.")
+        await bot.send_message(chat_id, "📭 Альбомы закончились.")
         return
 
     row = albums.iloc[index]
@@ -202,6 +274,7 @@ async def send_album(user_id):
 
     total = len(albums)
     progress = total - index
+    rating = await get_rating(user_id, album_list, rank)
 
     async with aiohttp.ClientSession() as session:
         cover, year = await get_cover_and_year(session, artist, album)
@@ -212,86 +285,101 @@ async def send_album(user_id):
         f"💿 <b>{album}</b>\n"
         f"📅 {year or '—'}\n"
         f"🎧 {genre}\n"
-        f"📊 Прогресс: {progress}/{total}"
+        f"📊 Прогресс: {progress}/{total}\n"
+        f"⭐ Ваша оценка: {rating if rating else '—'}"
     )
 
     if cover:
-        await bot.send_photo(user_id, cover, caption=caption, parse_mode="HTML", reply_markup=album_keyboard(artist))
+        await bot.send_photo(chat_id, cover, caption=caption, parse_mode="HTML", reply_markup=album_keyboard(artist, album))
     else:
-        await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=album_keyboard(artist))
+        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=album_keyboard(artist, album))
 
-    update_index(user_id, index - 1)
+    await update_index(user_id, index - 1)
 
-# ---------------- COMMANDS ----------------
+# ---------------- HANDLERS ----------------
 
-@dp.message_handler(commands=["start", "menu"])
-async def start(message: types.Message):
-    get_user(message.from_user.id)
+@dp.message(Command("start", "menu"))
+async def start(message: Message):
+    await get_user(message.from_user.id)
     await message.answer("📋 Главное меню", reply_markup=menu_keyboard())
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu")
-async def menu(call: types.CallbackQuery):
+@dp.callback_query(F.data == "menu")
+async def menu(call: CallbackQuery):
     await call.message.edit_text("📋 Главное меню", reply_markup=menu_keyboard())
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_pause")
-async def pause(call: types.CallbackQuery):
-    set_paused(call.from_user.id, 1)
+@dp.callback_query(F.data == "menu_pause")
+async def pause(call: CallbackQuery):
+    await set_paused(call.from_user.id, 1)
     await call.answer("⏸ Пауза")
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_resume")
-async def resume(call: types.CallbackQuery):
-    set_paused(call.from_user.id, 0)
+@dp.callback_query(F.data == "menu_resume")
+async def resume(call: CallbackQuery):
+    await set_paused(call.from_user.id, 0)
     await call.answer("▶️ Продолжаем")
-    await send_album(call.from_user.id)
+    await send_album(call.message.chat.id, call.from_user.id)
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_lists")
-async def lists_menu(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=1)
-    for f in os.listdir(ALBUMS_DIR):
-        if f.endswith(".xlsx"):
-            name = f.replace(".xlsx", "")
-            kb.add(InlineKeyboardButton(name, callback_data=f"list:{name}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu"))
+@dp.callback_query(F.data == "menu_lists")
+async def lists_menu(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f.replace('.xlsx',''), callback_data=f"list:{f.replace('.xlsx','')}")]
+        for f in os.listdir(ALBUMS_DIR) if f.endswith(".xlsx")
+    ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]])
 
     await call.message.edit_text("📚 Выбери список альбомов:", reply_markup=kb)
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("list:"))
-async def set_list(call: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("list:"))
+async def set_list(call: CallbackQuery):
     list_name = call.data.split(":", 1)[1]
-    set_album_list(call.from_user.id, list_name)
+    await set_album_list(call.from_user.id, list_name)
     await call.answer(f"Список: {list_name}")
-    await send_album(call.from_user.id)
+    await send_album(call.message.chat.id, call.from_user.id)
 
 
-@dp.callback_query_handler(lambda c: c.data == "next")
-async def next_album(call: types.CallbackQuery):
+@dp.callback_query(F.data == "next")
+async def next_album(call: CallbackQuery):
     await call.answer()
-    await send_album(call.from_user.id)
+    await send_album(call.message.chat.id, call.from_user.id)
 
 
-@dp.callback_query_handler(lambda c: c.data == "daily")
-async def daily_on(call: types.CallbackQuery):
-    cursor.execute("UPDATE users SET daily=1 WHERE user_id=?", (call.from_user.id,))
-    conn.commit()
-    await call.answer("📅 Daily включён")
+@dp.callback_query(F.data == "rate_menu")
+async def rate_menu(call: CallbackQuery):
+    album_list, index, _, _ = await get_user(call.from_user.id)
+    albums = get_albums(album_list)
+    row = albums.iloc[index + 1]
+    await call.message.reply("⭐ Поставь оценку:", reply_markup=rating_keyboard(album_list, row["rank"]))
+
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def rate(call: CallbackQuery):
+    _, album_list, rank, rating = call.data.split(":")
+    await set_rating(call.from_user.id, album_list, int(rank), int(rating))
+    await call.answer(f"Оценка: {rating} ⭐")
 
 # ---------------- DAILY ----------------
 
 async def daily_job():
-    cursor.execute("SELECT user_id FROM users WHERE daily=1 AND paused=0")
-    for (user_id,) in cursor.fetchall():
-        await send_album(user_id)
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users WHERE daily=1 AND paused=0")
+        for r in rows:
+            await send_album(r["user_id"], r["user_id"])
 
 
-async def on_startup(dp):
+async def on_startup():
+    await init_pg()
+    await migrate_from_sqlite()
     scheduler.add_job(daily_job, "cron", hour=10)
     scheduler.start()
 
 
+async def main():
+    await on_startup()
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
-    executor.start_polling(dp, on_startup=on_startup)
+    asyncio.run(main())
