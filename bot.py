@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from typing import Optional, Tuple, Dict
-from urllib.parse import quote_plus, quote, unquote_plus
+from urllib.parse import quote_plus, quote, unquote
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -474,7 +474,7 @@ def encode_list_name(name: str) -> str:
     return quote(name, safe="")
 
 def decode_list_name(encoded: str) -> str:
-    return unquote_plus(encoded)
+    return unquote(encoded)
 
 
 
@@ -547,7 +547,7 @@ async def render_album(user_id: int, album_list_override: Optional[str] = None) 
 
     cover = await get_cover_with_fallback(album_list, rank, artist, album)
     caption = album_caption(row, user_rating)
-    kb = album_keyboard(str(row['artist']), str(row['album']), rating, album_list, rank)
+    kb = album_keyboard(str(row['artist']), str(row['album']), user_rating, album_list, rank)
     return cover, caption, kb, album_list, rank, user_rating, artist, album, idx
 
 
@@ -593,7 +593,7 @@ async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, ran
         return
     row = row.iloc[0]
     caption = album_caption(row, rating)
-    kb = album_keyboard(str(row["artist"]), str(row["album"]), rating, album_list, rank)
+    kb = album_keyboard(str(row["artist"]), str(row["album"]), user_rating, album_list, rank)
 
     try:
         if call.message.photo:
@@ -757,7 +757,7 @@ async def lists_cb(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("setlist:"))
 async def setlist_cb(call: CallbackQuery):
-    wanted = call.data.split(":", 1)[1]
+    wanted = decode_list_name(call.data.split(":", 1)[1])
     names = available_album_lists()
     if wanted not in names:
         await call.answer("Список не найден", show_alert=True)
