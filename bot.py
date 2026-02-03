@@ -60,6 +60,119 @@ http_session: Optional[aiohttp.ClientSession] = None
 
 # ================= DATABASE =================
 
+async def migrate_album_list_keys(conn: asyncpg.Connection) -> None:
+    """Fix legacy encoded album_list values (e.g., top500%20RS) by decoding to human names.
+    Merges duplicates safely for user_progress, ratings, covers.
+    """
+    from urllib.parse import unquote_plus
+
+    # collect distinct album_list values
+    vals = set()
+    for q in [
+        "SELECT DISTINCT album_list FROM users",
+        "SELECT DISTINCT album_list FROM user_progress",
+        "SELECT DISTINCT album_list FROM ratings",
+        "SELECT DISTINCT album_list FROM covers",
+    ]:
+        try:
+            rows = await conn.fetch(q)
+            for r in rows:
+                if r["album_list"] is not None:
+                    vals.add(str(r["album_list"]))
+        except Exception:
+            # table may not exist yet or empty
+            pass
+
+    for old in sorted(vals):
+        new = unquote_plus(old).replace("\xa0", " ").strip()
+        # collapse repeated spaces
+        new = " ".join(new.split())
+        if not new or new == old:
+            continue
+
+        log.info("Migrating album_list key %r -> %r", old, new)
+
+        # users: simple update
+        await conn.execute("UPDATE users SET album_list=$1 WHERE album_list=$2", new, old)
+
+        # user_progress: merge rows per user
+        rows = await conn.fetch(
+            "SELECT user_id, current_index, updated_at FROM user_progress WHERE album_list=$1",
+            old
+        )
+        for r in rows:
+            uid = int(r["user_id"])
+            idx = int(r["current_index"])
+            upd = r["updated_at"] or datetime.now(timezone.utc)
+
+            await conn.execute(
+                """
+                INSERT INTO user_progress (user_id, album_list, current_index, updated_at)
+                VALUES ($1,$2,$3,$4)
+                ON CONFLICT (user_id, album_list)
+                DO UPDATE SET
+                    current_index = CASE
+                        WHEN user_progress.updated_at <= EXCLUDED.updated_at THEN EXCLUDED.current_index
+                        ELSE user_progress.current_index
+                    END,
+                    updated_at = GREATEST(user_progress.updated_at, EXCLUDED.updated_at)
+                """,
+                uid, new, idx, upd
+            )
+        await conn.execute("DELETE FROM user_progress WHERE album_list=$1", old)
+
+        # ratings: merge per user/rank, keep newest rated_at if exists
+        rows = await conn.fetch(
+            "SELECT user_id, rank, rating, rated_at FROM ratings WHERE album_list=$1",
+            old
+        )
+        for r in rows:
+            uid = int(r["user_id"])
+            rk = int(r["rank"])
+            rt = int(r["rating"])
+            ra = r["rated_at"]
+            await conn.execute(
+                """
+                INSERT INTO ratings (user_id, album_list, rank, rating, rated_at)
+                VALUES ($1,$2,$3,$4,$5)
+                ON CONFLICT (user_id, album_list, rank)
+                DO UPDATE SET
+                    rating = CASE
+                        WHEN EXCLUDED.rated_at IS NOT NULL
+                             AND (ratings.rated_at IS NULL OR EXCLUDED.rated_at >= ratings.rated_at)
+                        THEN EXCLUDED.rating
+                        ELSE ratings.rating
+                    END,
+                    rated_at = COALESCE(GREATEST(ratings.rated_at, EXCLUDED.rated_at), ratings.rated_at, EXCLUDED.rated_at)
+                """,
+                uid, new, rk, rt, ra
+            )
+        await conn.execute("DELETE FROM ratings WHERE album_list=$1", old)
+
+        # covers: merge per rank, keep newest updated_at
+        rows = await conn.fetch(
+            "SELECT rank, cover_url, source, updated_at FROM covers WHERE album_list=$1",
+            old
+        )
+        for r in rows:
+            rk = int(r["rank"])
+            url = str(r["cover_url"])
+            src_ = str(r["source"])
+            ua = r["updated_at"] or datetime.now(timezone.utc)
+            await conn.execute(
+                """
+                INSERT INTO covers (album_list, rank, cover_url, source, updated_at)
+                VALUES ($1,$2,$3,$4,$5)
+                ON CONFLICT (album_list, rank)
+                DO UPDATE SET
+                    cover_url = CASE WHEN covers.updated_at <= EXCLUDED.updated_at THEN EXCLUDED.cover_url ELSE covers.cover_url END,
+                    source = CASE WHEN covers.updated_at <= EXCLUDED.updated_at THEN EXCLUDED.source ELSE covers.source END,
+                    updated_at = GREATEST(covers.updated_at, EXCLUDED.updated_at)
+                """,
+                new, rk, url, src_, ua
+            )
+        await conn.execute("DELETE FROM covers WHERE album_list=$1", old)
+
 async def init_pg() -> None:
     global pg_pool
     pg_pool = await asyncpg.create_pool(dsn=Config.DATABASE_URL, min_size=1, max_size=5)
@@ -129,6 +242,9 @@ async def init_pg() -> None:
         CREATE INDEX IF NOT EXISTS idx_covers_updated
         ON covers (updated_at)
         """)
+        # Normalize legacy encoded list names (e.g., %20) to prevent progress split
+        await migrate_album_list_keys(conn)
+
 
 def _pool() -> asyncpg.Pool:
     if pg_pool is None:
@@ -471,10 +587,13 @@ def album_keyboard(artist: str, album: str, rated: Optional[int], album_list: st
 
 def encode_list_name(name: str) -> str:
     # callback_data must be ASCII; percent-encode
+    name = " ".join(str(name).replace("\xa0", " ").strip().split())
     return quote(name, safe="")
 
 def decode_list_name(encoded: str) -> str:
-    return unquote(encoded)
+    # be tolerant to legacy encoding (%20 and +) and normalize whitespace
+    from urllib.parse import unquote_plus
+    return " ".join(unquote_plus(encoded).replace("\xa0", " ").strip().split())
 
 
 
@@ -592,13 +711,14 @@ async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, ran
     if row.empty:
         return
     row = row.iloc[0]
+
     caption = album_caption(row, rating)
-    kb = album_keyboard(str(row["artist"]), str(row["album"]), user_rating, album_list, rank)
+    kb = album_keyboard(str(row["artist"]), str(row["album"]), rating, album_list, rank)
 
     try:
-        if call.message.photo:
+        if call.message and getattr(call.message, "photo", None):
             await call.message.edit_caption(caption=caption, parse_mode="HTML", reply_markup=kb)
-        else:
+        elif call.message:
             await call.message.edit_text(caption, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         log.debug("edit after rating failed: %s", e)
