@@ -1,8 +1,6 @@
-# TELEGRAM BOT (aiogram 3 + PostgreSQL)
-# - UX unchanged
-# - PostgreSQL storage
-# - automatic migration from old SQLite users.db
-# - ratings, menus, lists, groups supported
+# TELEGRAM BOT — aiogram 3 + PostgreSQL
+# Full rebuild with fixes for aiogram 3 (safe_edit, keyboards)
+# UX unchanged
 
 import os
 import asyncio
@@ -12,7 +10,12 @@ import aiohttp
 from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -20,7 +23,7 @@ import asyncpg
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TOKEN:
     raise RuntimeError("TOKEN not set")
@@ -224,35 +227,58 @@ async def get_cover_and_year(session, artist, album):
 
     return None, None
 
-# ---------------- UI ----------------
+# ---------------- UI HELPERS ----------------
 
 def google_album_link(artist, album):
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
 
 def rating_keyboard(album_list, rank):
-    kb = InlineKeyboardMarkup(row_width=5)
-    for i in range(1, 6):
-        kb.insert(InlineKeyboardButton(text=str(i), callback_data=f"rate:{album_list}:{rank}:{i}"))
-    kb.add(InlineKeyboardButton(text="⬅️ Назад", callback_data="menu"))
-    return kb
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=str(i),
+                    callback_data=f"rate:{album_list}:{rank}:{i}"
+                ) for i in range(1, 6)
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]
+        ]
+    )
 
 
 def album_keyboard(artist, album):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔎 Найти альбом", url=google_album_link(artist, album))],
-        [InlineKeyboardButton(text="⭐ Оценить", callback_data="rate_menu")],
-        [InlineKeyboardButton(text="➡️ Следующий альбом", callback_data="next")],
-        [InlineKeyboardButton(text="📋 Меню", callback_data="menu")]
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Найти альбом", url=google_album_link(artist, album))],
+            [InlineKeyboardButton(text="⭐ Оценить", callback_data="rate_menu")],
+            [InlineKeyboardButton(text="➡️ Следующий альбом", callback_data="next")],
+            [InlineKeyboardButton(text="📋 Меню", callback_data="menu")]
+        ]
+    )
 
 
 def menu_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📚 Списки альбомов", callback_data="menu_lists")],
-        [InlineKeyboardButton(text="▶️ Продолжить", callback_data="menu_resume")],
-        [InlineKeyboardButton(text="⏸ Пауза", callback_data="menu_pause")]
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📚 Списки альбомов", callback_data="menu_lists")],
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data="menu_resume")],
+            [InlineKeyboardButton(text="⏸ Пауза", callback_data="menu_pause")]
+        ]
+    )
+
+
+async def safe_edit(call: CallbackQuery, text: str, reply_markup=None):
+    msg = call.message
+    try:
+        if msg.text:
+            await msg.edit_text(text, reply_markup=reply_markup)
+        elif msg.caption:
+            await msg.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await msg.answer(text, reply_markup=reply_markup)
+    except Exception:
+        await msg.answer(text, reply_markup=reply_markup)
 
 # ---------------- CORE ----------------
 
@@ -306,7 +332,7 @@ async def start(message: Message):
 
 @dp.callback_query(F.data == "menu")
 async def menu(call: CallbackQuery):
-    await call.message.edit_text("📋 Главное меню", reply_markup=menu_keyboard())
+    await safe_edit(call, "📋 Главное меню", menu_keyboard())
 
 
 @dp.callback_query(F.data == "menu_pause")
@@ -324,12 +350,14 @@ async def resume(call: CallbackQuery):
 
 @dp.callback_query(F.data == "menu_lists")
 async def lists_menu(call: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f.replace('.xlsx',''), callback_data=f"list:{f.replace('.xlsx','')}")]
-        for f in os.listdir(ALBUMS_DIR) if f.endswith(".xlsx")
-    ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f.replace('.xlsx',''), callback_data=f"list:{f.replace('.xlsx','')}")]
+            for f in os.listdir(ALBUMS_DIR) if f.endswith(".xlsx")
+        ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]]
+    )
 
-    await call.message.edit_text("📚 Выбери список альбомов:", reply_markup=kb)
+    await safe_edit(call, "📚 Выбери список альбомов:", kb)
 
 
 @dp.callback_query(F.data.startswith("list:"))
@@ -351,7 +379,10 @@ async def rate_menu(call: CallbackQuery):
     album_list, index, _, _ = await get_user(call.from_user.id)
     albums = get_albums(album_list)
     row = albums.iloc[index + 1]
-    await call.message.reply("⭐ Поставь оценку:", reply_markup=rating_keyboard(album_list, row["rank"]))
+    await call.message.answer(
+        "⭐ Поставь оценку:",
+        reply_markup=rating_keyboard(album_list, row["rank"])
+    )
 
 
 @dp.callback_query(F.data.startswith("rate:"))
