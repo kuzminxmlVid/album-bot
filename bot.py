@@ -1,6 +1,9 @@
 # TELEGRAM BOT — aiogram 3 + PostgreSQL
-# Full rebuild with fixes for aiogram 3 (safe_edit, keyboards)
-# UX unchanged
+# Added:
+# - /my_ratings command
+# - statistics (average rating)
+# - config section
+# - live rating update in album post
 
 import os
 import asyncio
@@ -10,40 +13,40 @@ import aiohttp
 from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import asyncpg
 
-# ---------------- CONFIG ----------------
-TOKEN = os.getenv("TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ================= CONFIG =================
 
-if not TOKEN:
+class Config:
+    TOKEN = os.getenv("TOKEN")
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    DEFAULT_LIST = os.getenv("ALBUM_LIST", "top100")
+    ALBUMS_DIR = "albums"
+    DAILY_HOUR = int(os.getenv("DAILY_HOUR", 10))
+
+
+if not Config.TOKEN:
     raise RuntimeError("TOKEN not set")
-if not DATABASE_URL:
+if not Config.DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-ALBUMS_DIR = "albums"
-DEFAULT_LIST = os.getenv("ALBUM_LIST", "top100")
+# ================= BOT =================
 
-# ---------------- BOT ----------------
-bot = Bot(token=TOKEN)
+bot = Bot(token=Config.TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# ---------------- POSTGRES ----------------
+# ================= POSTGRES =================
+
 pg_pool: asyncpg.Pool | None = None
 
 async def init_pg():
     global pg_pool
-    pg_pool = await asyncpg.create_pool(DATABASE_URL)
+    pg_pool = await asyncpg.create_pool(Config.DATABASE_URL)
 
     async with pg_pool.acquire() as conn:
         await conn.execute("""
@@ -66,7 +69,7 @@ async def init_pg():
         )
         """)
 
-# ---------------- MIGRATION ----------------
+# ================= MIGRATION =================
 
 async def migrate_from_sqlite():
     if not os.path.exists("users.db"):
@@ -94,20 +97,21 @@ async def migrate_from_sqlite():
     sqlite_conn.close()
     os.rename("users.db", "users.db.migrated")
 
-# ---------------- ALBUM LISTS ----------------
-
-def load_albums(list_name: str):
-    df = pd.read_excel(f"{ALBUMS_DIR}/{list_name}.xlsx")
-    return df.sort_values("rank").reset_index(drop=True)
+# ================= ALBUM LISTS =================
 
 album_cache = {}
+
+def load_albums(list_name: str):
+    df = pd.read_excel(f"{Config.ALBUMS_DIR}/{list_name}.xlsx")
+    return df.sort_values("rank").reset_index(drop=True)
+
 
 def get_albums(list_name):
     if list_name not in album_cache:
         album_cache[list_name] = load_albums(list_name)
     return album_cache[list_name]
 
-# ---------------- USERS ----------------
+# ================= USERS =================
 
 async def get_user(user_id: int):
     async with pg_pool.acquire() as conn:
@@ -117,23 +121,20 @@ async def get_user(user_id: int):
         )
 
         if row is None:
-            albums = get_albums(DEFAULT_LIST)
+            albums = get_albums(Config.DEFAULT_LIST)
             start_index = len(albums) - 1
             await conn.execute(
                 "INSERT INTO users VALUES ($1,$2,$3,0,0)",
-                user_id, DEFAULT_LIST, start_index
+                user_id, Config.DEFAULT_LIST, start_index
             )
-            return DEFAULT_LIST, start_index, 0, 0
+            return Config.DEFAULT_LIST, start_index, 0, 0
 
         return row["album_list"], row["current_index"], row["daily"], row["paused"]
 
 
 async def update_index(user_id, index):
     async with pg_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET current_index=$1 WHERE user_id=$2",
-            index, user_id
-        )
+        await conn.execute("UPDATE users SET current_index=$1 WHERE user_id=$2", index, user_id)
 
 
 async def set_album_list(user_id, list_name):
@@ -147,17 +148,16 @@ async def set_album_list(user_id, list_name):
 
 async def set_paused(user_id, value):
     async with pg_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET paused=$1 WHERE user_id=$2",
-            value, user_id
-        )
+        await conn.execute("UPDATE users SET paused=$1 WHERE user_id=$2", value, user_id)
 
-# ---------------- RATINGS ----------------
+# ================= RATINGS =================
 
 async def set_rating(user_id, album_list, rank, rating):
     async with pg_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO ratings VALUES ($1,$2,$3,$4) ON CONFLICT (user_id,album_list,rank) DO UPDATE SET rating=$4",
+            "INSERT INTO ratings VALUES ($1,$2,$3,$4)
+             ON CONFLICT (user_id,album_list,rank)
+             DO UPDATE SET rating=$4",
             user_id, album_list, rank, rating
         )
 
@@ -170,7 +170,24 @@ async def get_rating(user_id, album_list, rank):
         )
         return row["rating"] if row else None
 
-# ---------------- COVERS ----------------
+
+async def get_user_ratings(user_id):
+    async with pg_pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT album_list, rank, rating FROM ratings WHERE user_id=$1 ORDER BY album_list, rank",
+            user_id
+        )
+
+
+async def get_average_rating(album_list, rank):
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT ROUND(AVG(rating),2) as avg FROM ratings WHERE album_list=$1 AND rank=$2",
+            album_list, rank
+        )
+        return row["avg"] if row and row["avg"] else None
+
+# ================= COVERS =================
 
 async def itunes_cover(session, artist, album):
     try:
@@ -180,13 +197,9 @@ async def itunes_cover(session, artist, album):
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10
         ) as r:
-            if r.status != 200:
-                return None, None
             data = await r.json(content_type=None)
-
         if data.get("resultCount", 0) == 0:
             return None, None
-
         item = data["results"][0]
         cover = item.get("artworkUrl100")
         if cover:
@@ -204,13 +217,9 @@ async def deezer_cover(session, artist, album):
             params={"q": f"{artist} {album}"},
             timeout=10
         ) as r:
-            if r.status != 200:
-                return None
             data = await r.json()
-
         if not data.get("data"):
             return None
-
         return data["data"][0].get("cover_xl")
     except Exception:
         return None
@@ -220,14 +229,12 @@ async def get_cover_and_year(session, artist, album):
     cover, year = await itunes_cover(session, artist, album)
     if cover:
         return cover, year
-
     cover = await deezer_cover(session, artist, album)
     if cover:
         return cover, None
-
     return None, None
 
-# ---------------- UI HELPERS ----------------
+# ================= UI =================
 
 def google_album_link(artist, album):
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
@@ -236,12 +243,7 @@ def google_album_link(artist, album):
 def rating_keyboard(album_list, rank):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=str(i),
-                    callback_data=f"rate:{album_list}:{rank}:{i}"
-                ) for i in range(1, 6)
-            ],
+            [InlineKeyboardButton(text=str(i), callback_data=f"rate:{album_list}:{rank}:{i}") for i in range(1, 6)],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]
         ]
     )
@@ -280,7 +282,7 @@ async def safe_edit(call: CallbackQuery, text: str, reply_markup=None):
     except Exception:
         await msg.answer(text, reply_markup=reply_markup)
 
-# ---------------- CORE ----------------
+# ================= CORE =================
 
 async def send_album(chat_id, user_id):
     album_list, index, _, paused = await get_user(user_id)
@@ -300,7 +302,8 @@ async def send_album(chat_id, user_id):
 
     total = len(albums)
     progress = total - index
-    rating = await get_rating(user_id, album_list, rank)
+    user_rating = await get_rating(user_id, album_list, rank)
+    avg_rating = await get_average_rating(album_list, rank)
 
     async with aiohttp.ClientSession() as session:
         cover, year = await get_cover_and_year(session, artist, album)
@@ -312,7 +315,8 @@ async def send_album(chat_id, user_id):
         f"📅 {year or '—'}\n"
         f"🎧 {genre}\n"
         f"📊 Прогресс: {progress}/{total}\n"
-        f"⭐ Ваша оценка: {rating if rating else '—'}"
+        f"⭐ Ваша оценка: {user_rating if user_rating else '—'}\n"
+        f"🌍 Средняя оценка: {avg_rating if avg_rating else '—'}"
     )
 
     if cover:
@@ -322,12 +326,26 @@ async def send_album(chat_id, user_id):
 
     await update_index(user_id, index - 1)
 
-# ---------------- HANDLERS ----------------
+# ================= HANDLERS =================
 
 @dp.message(Command("start", "menu"))
 async def start(message: Message):
     await get_user(message.from_user.id)
     await message.answer("📋 Главное меню", reply_markup=menu_keyboard())
+
+
+@dp.message(Command("my_ratings"))
+async def my_ratings(message: Message):
+    rows = await get_user_ratings(message.from_user.id)
+    if not rows:
+        await message.answer("У тебя пока нет оценок.")
+        return
+
+    text = "⭐ <b>Мои оценки</b>\n"
+    for r in rows:
+        text += f"\n{r['album_list']} — #{r['rank']}: {r['rating']}"
+
+    await message.answer(text, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "menu")
@@ -353,10 +371,9 @@ async def lists_menu(call: CallbackQuery):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f.replace('.xlsx',''), callback_data=f"list:{f.replace('.xlsx','')}")]
-            for f in os.listdir(ALBUMS_DIR) if f.endswith(".xlsx")
+            for f in os.listdir(Config.ALBUMS_DIR) if f.endswith(".xlsx")
         ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]]
     )
-
     await safe_edit(call, "📚 Выбери список альбомов:", kb)
 
 
@@ -379,10 +396,7 @@ async def rate_menu(call: CallbackQuery):
     album_list, index, _, _ = await get_user(call.from_user.id)
     albums = get_albums(album_list)
     row = albums.iloc[index + 1]
-    await call.message.answer(
-        "⭐ Поставь оценку:",
-        reply_markup=rating_keyboard(album_list, row["rank"])
-    )
+    await call.message.answer("⭐ Поставь оценку:", reply_markup=rating_keyboard(album_list, row["rank"]))
 
 
 @dp.callback_query(F.data.startswith("rate:"))
@@ -390,8 +404,9 @@ async def rate(call: CallbackQuery):
     _, album_list, rank, rating = call.data.split(":")
     await set_rating(call.from_user.id, album_list, int(rank), int(rating))
     await call.answer(f"Оценка: {rating} ⭐")
+    await send_album(call.message.chat.id, call.from_user.id)
 
-# ---------------- DAILY ----------------
+# ================= DAILY =================
 
 async def daily_job():
     async with pg_pool.acquire() as conn:
@@ -403,7 +418,7 @@ async def daily_job():
 async def on_startup():
     await init_pg()
     await migrate_from_sqlite()
-    scheduler.add_job(daily_job, "cron", hour=10)
+    scheduler.add_job(daily_job, "cron", hour=Config.DAILY_HOUR)
     scheduler.start()
 
 
