@@ -1,7 +1,3 @@
-# TELEGRAM BOT — aiogram 3 + PostgreSQL
-# Fixed syntax error in set_rating
-# Added /my_ratings, statistics, config, live rating update
-
 import os
 import asyncio
 import sqlite3
@@ -9,11 +5,10 @@ import pandas as pd
 import aiohttp
 from urllib.parse import quote_plus
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 import asyncpg
 
 # ================= CONFIG =================
@@ -30,15 +25,15 @@ if not Config.TOKEN:
 if not Config.DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-# ================= BOT =================
+# ================= GLOBALS =================
 
 bot = Bot(token=Config.TOKEN)
 dp = Dispatcher()
+router = Router()
 scheduler = AsyncIOScheduler()
+pg_pool: asyncpg.Pool | None = None
 
 # ================= POSTGRES =================
-
-pg_pool: asyncpg.Pool | None = None
 
 async def init_pg():
     global pg_pool
@@ -64,34 +59,6 @@ async def init_pg():
             PRIMARY KEY (user_id, album_list, rank)
         )
         """)
-
-# ================= MIGRATION =================
-
-async def migrate_from_sqlite():
-    if not os.path.exists("users.db"):
-        return
-
-    sqlite_conn = sqlite3.connect("users.db")
-    sc = sqlite_conn.cursor()
-
-    async with pg_pool.acquire() as pg:
-        for row in sc.execute("SELECT user_id, album_list, current_index, daily, paused FROM users"):
-            await pg.execute(
-                "INSERT INTO users VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
-                *row
-            )
-        try:
-            for row in sc.execute("SELECT user_id, album_list, rank, rating FROM ratings"):
-                await pg.execute(
-                    "INSERT INTO ratings (user_id, album_list, rank, rating) VALUES ($1,$2,$3,$4)"
-                    " ON CONFLICT (user_id, album_list, rank) DO UPDATE SET rating=$4",
-                    *row
-                )
-        except sqlite3.OperationalError:
-            pass
-
-    sqlite_conn.close()
-    os.rename("users.db", "users.db.migrated")
 
 # ================= ALBUM LISTS =================
 
@@ -126,49 +93,114 @@ async def get_user(user_id: int):
 
 async def update_index(user_id, index):
     async with pg_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET current_index=$1 WHERE user_id=$2", index, user_id)
+        await conn.execute(
+            "UPDATE users SET current_index=$1 WHERE user_id=$2",
+            index, user_id
+        )
 
-async def set_album_list(user_id, list_name):
-    albums = get_albums(list_name)
-    async with pg_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET album_list=$1, current_index=$2 WHERE user_id=$3",
-                           list_name, len(albums) - 1, user_id)
+# ================= UI =================
 
-async def set_paused(user_id, value):
-    async with pg_pool.acquire() as conn:
-        await conn.execute("UPDATE users SET paused=$1 WHERE user_id=$2", value, user_id)
+def google_album_link(artist, album):
+    q = quote_plus(f"{artist} {album}")
+    return f"https://www.google.com/search?q={q}"
 
-# ================= RATINGS =================
+def rating_keyboard():
+    kb = InlineKeyboardMarkup(row_width=5)
+    for i in range(1, 6):
+        kb.insert(InlineKeyboardButton(text=f"⭐ {i}", callback_data=f"rate:{i}"))
+    return kb
 
-async def set_rating(user_id, album_list, rank, rating):
+def album_keyboard(artist, album):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎧 Найти альбом", url=google_album_link(artist, album))],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="prev"),
+            InlineKeyboardButton(text="➡️ Далее", callback_data="next")
+        ],
+        [InlineKeyboardButton(text="⭐ Оценить", callback_data="rate_menu")]
+    ])
+
+# ================= CORE =================
+
+async def send_album(user_id, step=0):
+    album_list, index, _, paused = await get_user(user_id)
+    if paused:
+        return
+
+    albums = get_albums(album_list)
+    index = index + step
+
+    if index < 0 or index >= len(albums):
+        await bot.send_message(user_id, "📭 Альбомы закончились")
+        return
+
+    row = albums.iloc[index]
+    artist, album, genre, rank = row["artist"], row["album"], row["genre"], row["rank"]
+
+    caption = (
+        f"🏆 <b>#{rank}</b>\n"
+        f"🎤 <b>{artist}</b>\n"
+        f"💿 <b>{album}</b>\n"
+        f"🎧 {genre}"
+    )
+
+    await bot.send_message(
+        user_id,
+        caption,
+        parse_mode="HTML",
+        reply_markup=album_keyboard(artist, album)
+    )
+
+    await update_index(user_id, index)
+
+# ================= HANDLERS =================
+
+@router.message(Command("start"))
+async def start(message: Message):
+    if message.chat.type != "private":
+        await message.reply("Напиши мне в личные сообщения 🙂")
+        return
+    await get_user(message.from_user.id)
+    await send_album(message.from_user.id)
+
+@router.callback_query(F.data == "next")
+async def next_album(call: CallbackQuery):
+    await call.answer()
+    await send_album(call.from_user.id, -1)
+
+@router.callback_query(F.data == "prev")
+async def prev_album(call: CallbackQuery):
+    await call.answer()
+    await send_album(call.from_user.id, 1)
+
+@router.callback_query(F.data == "rate_menu")
+async def rate_menu(call: CallbackQuery):
+    await call.message.answer("Оцени альбом:", reply_markup=rating_keyboard())
+
+@router.callback_query(F.data.startswith("rate:"))
+async def rate_album(call: CallbackQuery):
+    rating = int(call.data.split(":")[1])
+    album_list, index, _, _ = await get_user(call.from_user.id)
+    albums = get_albums(album_list)
+    rank = albums.iloc[index]["rank"]
+
     async with pg_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO ratings (user_id, album_list, rank, rating) VALUES ($1,$2,$3,$4)"
-            " ON CONFLICT (user_id, album_list, rank) DO UPDATE SET rating=$4",
-            user_id, album_list, rank, rating
+            "INSERT INTO ratings VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (user_id, album_list, rank) DO UPDATE SET rating=$4",
+            call.from_user.id, album_list, rank, rating
         )
 
-async def get_rating(user_id, album_list, rank):
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT rating FROM ratings WHERE user_id=$1 AND album_list=$2 AND rank=$3",
-            user_id, album_list, rank
-        )
-        return row["rating"] if row else None
+    await call.answer(f"⭐ {rating} сохранено")
 
-async def get_user_ratings(user_id):
-    async with pg_pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT album_list, rank, rating FROM ratings WHERE user_id=$1 ORDER BY album_list, rank",
-            user_id
-        )
+# ================= STARTUP =================
 
-async def get_average_rating(album_list, rank):
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT ROUND(AVG(rating),2) as avg FROM ratings WHERE album_list=$1 AND rank=$2",
-            album_list, rank
-        )
-        return row["avg"] if row and row["avg"] else None
+async def main():
+    await init_pg()
+    dp.include_router(router)
 
-# ================= (rest of the bot code remains same as previous version) =================
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(main())
