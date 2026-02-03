@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 from typing import Optional, Tuple, Dict
+from urllib.parse import quote_plus
+from datetime import datetime, timezone
 
 import pandas as pd
 import aiohttp
@@ -14,7 +16,6 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    InputMediaPhoto,
 )
 
 # ================= LOGGING =================
@@ -34,6 +35,11 @@ class Config:
 
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     ALBUMS_DIR = os.getenv("ALBUMS_DIR", os.path.join(BASE_DIR, "albums"))
+
+    # MusicBrainz требует User-Agent. Лучше указать контакт.
+    # Можно задать переменной окружения MB_CONTACT, например "you@example.com"
+    MB_CONTACT = os.getenv("MB_CONTACT", "contact:not_set")
+    MB_APP = os.getenv("MB_APP", "MusicAlbumClubBot/1.0")
 
 if not Config.TOKEN or not Config.DATABASE_URL:
     raise RuntimeError("ENV vars not set: TOKEN and/or DATABASE_URL")
@@ -77,6 +83,22 @@ async def init_pg() -> None:
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_ratings_user
         ON ratings (user_id, album_list)
+        """)
+
+        # Cover cache (per list+rank)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS covers (
+            album_list TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            cover_url TEXT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (album_list, rank)
+        )
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_covers_updated
+        ON covers (updated_at)
         """)
 
 def _pool() -> asyncpg.Pool:
@@ -124,8 +146,7 @@ async def get_user(user_id: int) -> Tuple[str, int]:
         )
         if not row:
             albums = get_albums(Config.DEFAULT_LIST)
-            # original behavior: start from the last row and go backwards
-            idx = len(albums) - 1
+            idx = len(albums) - 1  # start from the end and go backwards
             await conn.execute(
                 "INSERT INTO users (user_id, album_list, current_index) VALUES ($1,$2,$3)",
                 user_id, Config.DEFAULT_LIST, idx
@@ -140,7 +161,7 @@ async def set_index(user_id: int, idx: int) -> None:
             idx, user_id
         )
 
-# ================= HTTP / COVER =================
+# ================= HTTP =================
 
 async def init_http() -> None:
     global http_session
@@ -153,10 +174,35 @@ def _http() -> aiohttp.ClientSession:
         raise RuntimeError("HTTP session is not initialized")
     return http_session
 
-async def get_cover(artist: str, album: str) -> Optional[str]:
-    """
-    Fetch cover URL from iTunes Search API.
-    """
+def _mb_headers() -> Dict[str, str]:
+    return {"User-Agent": f"{Config.MB_APP} ({Config.MB_CONTACT})"}
+
+# ================= COVER CACHE =================
+
+async def get_cached_cover(album_list: str, rank: int) -> Optional[str]:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT cover_url FROM covers WHERE album_list=$1 AND rank=$2",
+            album_list, rank
+        )
+        return row["cover_url"] if row else None
+
+async def set_cached_cover(album_list: str, rank: int, cover_url: str, source: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO covers (album_list, rank, cover_url, source, updated_at)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (album_list, rank)
+            DO UPDATE SET cover_url=EXCLUDED.cover_url, source=EXCLUDED.source, updated_at=EXCLUDED.updated_at
+            """,
+            album_list, rank, cover_url, source, now
+        )
+
+# ================= COVER SOURCES =================
+
+async def cover_from_itunes(artist: str, album: str) -> Optional[str]:
     try:
         s = _http()
         async with s.get(
@@ -167,7 +213,72 @@ async def get_cover(artist: str, album: str) -> Optional[str]:
             if data.get("resultCount"):
                 return data["results"][0]["artworkUrl100"].replace("100x100", "600x600")
     except Exception as e:
-        log.debug("cover fetch failed: %s", e)
+        log.debug("itunes cover failed: %s", e)
+    return None
+
+async def cover_from_deezer(artist: str, album: str) -> Optional[str]:
+    try:
+        s = _http()
+        q = quote_plus(f'artist:"{artist}" album:"{album}"')
+        async with s.get(f"https://api.deezer.com/search/album?q={q}") as r:
+            data = await r.json(content_type=None)
+            items = data.get("data") or []
+            if not items:
+                return None
+            item = items[0]
+            return item.get("cover_xl") or item.get("cover_big") or item.get("cover") or item.get("cover_medium")
+    except Exception as e:
+        log.debug("deezer cover failed: %s", e)
+    return None
+
+async def cover_from_musicbrainz_caa(artist: str, album: str) -> Optional[str]:
+    try:
+        s = _http()
+        q = quote_plus(f'release:"{album}" AND artist:"{artist}"')
+        mb_url = f"https://musicbrainz.org/ws/2/release/?query={q}&fmt=json&limit=1"
+        async with s.get(mb_url, headers=_mb_headers()) as r:
+            data = await r.json(content_type=None)
+            rels = data.get("releases") or []
+            if not rels:
+                return None
+            mbid = rels[0].get("id")
+            if not mbid:
+                return None
+
+        caa_url = f"https://coverartarchive.org/release/{mbid}"
+        async with s.get(caa_url) as r:
+            if r.status != 200:
+                return None
+            data = await r.json(content_type=None)
+            imgs = data.get("images") or []
+            if not imgs:
+                return None
+            front = next((i for i in imgs if i.get("front")), imgs[0])
+            return front.get("image")
+    except Exception as e:
+        log.debug("musicbrainz/caa cover failed: %s", e)
+    return None
+
+async def get_cover_with_fallback(album_list: str, rank: int, artist: str, album: str) -> Optional[str]:
+    cached = await get_cached_cover(album_list, rank)
+    if cached:
+        return cached
+
+    url = await cover_from_itunes(artist, album)
+    if url:
+        await set_cached_cover(album_list, rank, url, "itunes")
+        return url
+
+    url = await cover_from_deezer(artist, album)
+    if url:
+        await set_cached_cover(album_list, rank, url, "deezer")
+        return url
+
+    url = await cover_from_musicbrainz_caa(artist, album)
+    if url:
+        await set_cached_cover(album_list, rank, url, "musicbrainz_caa")
+        return url
+
     return None
 
 # ================= RATINGS =================
@@ -195,16 +306,15 @@ async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -
 # ================= UI =================
 
 def google_link(artist: str, album: str) -> str:
-    q = aiohttp.helpers.quote(f"{artist} {album}", safe="")
-    return f"https://www.google.com/search?q={q}"
+    return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
 def album_keyboard(artist: str, album: str, rated: Optional[int]) -> InlineKeyboardMarkup:
     rate_text = "⭐ Оценить" if not rated else f"⭐ Оценено: {rated}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎧 Найти альбом", url=google_link(artist, album))],
         [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:prev"),
-            InlineKeyboardButton(text="➡️ Далее", callback_data="nav:next")
+            InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
+            InlineKeyboardButton(text="Пропустить", callback_data="nav:next")
         ],
         [
             InlineKeyboardButton(text=rate_text, callback_data="ui:rate"),
@@ -213,7 +323,6 @@ def album_keyboard(artist: str, album: str, rated: Optional[int]) -> InlineKeybo
     ])
 
 def rating_keyboard(album_list: str, rank: int) -> InlineKeyboardMarkup:
-    # rate:{rating}:{album_list}:{rank}
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=f"⭐ {i}", callback_data=f"rate:{i}:{album_list}:{rank}")
@@ -243,9 +352,6 @@ def album_caption(row: pd.Series, user_rating: Optional[int]) -> str:
 # ================= CORE =================
 
 async def render_album(user_id: int) -> Tuple[Optional[str], str, InlineKeyboardMarkup, str, int, Optional[int]]:
-    """
-    Returns (cover_url, caption_html, keyboard, album_list, rank, user_rating)
-    """
     album_list, idx = await get_user(user_id)
     albums = get_albums(album_list)
 
@@ -256,15 +362,12 @@ async def render_album(user_id: int) -> Tuple[Optional[str], str, InlineKeyboard
     rank = int(row["rank"])
     user_rating = await get_user_rating(user_id, album_list, rank)
 
-    cover = await get_cover(str(row["artist"]), str(row["album"]))
+    cover = await get_cover_with_fallback(album_list, rank, str(row["artist"]), str(row["album"]))
     caption = album_caption(row, user_rating)
     kb = album_keyboard(str(row["artist"]), str(row["album"]), user_rating)
     return cover, caption, kb, album_list, rank, user_rating
 
 async def send_album_post(user_id: int) -> None:
-    """
-    Каждый альбом — отдельный пост (отдельное сообщение).
-    """
     cover, caption, kb, _, _, _ = await render_album(user_id)
 
     if caption.startswith("📭"):
@@ -277,9 +380,6 @@ async def send_album_post(user_id: int) -> None:
         await bot.send_message(user_id, caption, parse_mode="HTML", reply_markup=kb)
 
 async def edit_album_post_after_rating(call: CallbackQuery, album_list: str, rank: int, rating: int) -> None:
-    """
-    После оценки: оценка появляется в текущем посте (редактируем именно этот пост).
-    """
     albums = get_albums(album_list)
     row = albums.loc[albums["rank"] == rank]
     if row.empty:
@@ -312,16 +412,14 @@ async def build_stats_text(user_id: int) -> str:
             user_id, album_list
         )
         avg = await conn.fetchval(
-            "SELECT AVG(rating)::float FROM ratings WHERE user_id=$1 AND album_list=$2",
+            "SELECT AVG(rating) FROM ratings WHERE user_id=$1 AND album_list=$2",
             user_id, album_list
         )
 
     dist = {int(r["rating"]): int(r["c"]) for r in rows}
-    lines = []
-    for i in range(1, 6):
-        lines.append(f"{i}: {dist.get(i, 0)}")
+    lines = [f"{i}: {dist.get(i, 0)}" for i in range(1, 6)]
+    avg_txt = f"{float(avg):.2f}" if avg is not None else "—"
 
-    avg_txt = f"{avg:.2f}" if avg is not None else "—"
     return (
         f"📊 <b>Статистика</b>\n\n"
         f"📃 Список: <b>{album_list}</b>\n"
@@ -329,6 +427,13 @@ async def build_stats_text(user_id: int) -> str:
         f"⭐ Средняя: <b>{avg_txt}</b>\n\n"
         f"Распределение оценок:\n" + "\n".join(lines)
     )
+
+# ================= ERROR HANDLER =================
+
+@router.errors()
+async def on_error(event, exception):
+    log.exception("Unhandled error: %s", exception)
+    return True
 
 # ================= HANDLERS =================
 
@@ -395,7 +500,6 @@ async def rate_ui(call: CallbackQuery):
     row = albums.iloc[idx]
     rank = int(row["rank"])
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
-
     caption = album_caption(row, current_rating)
 
     await call.answer()
@@ -418,7 +522,6 @@ async def rate_ui(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("rate:"))
 async def rate_set(call: CallbackQuery):
-    # rate:{rating}:{album_list}:{rank}
     parts = call.data.split(":")
     if len(parts) != 4:
         await call.answer("Ошибка кнопки", show_alert=True)
@@ -431,12 +534,11 @@ async def rate_set(call: CallbackQuery):
     await upsert_rating(call.from_user.id, album_list, rank, rating)
     await call.answer(f"⭐ {rating} сохранено")
 
-    # 1) показать оценку в текущем посте
+    # 1) show rating in THIS post
     await edit_album_post_after_rating(call, album_list, rank, rating)
 
-    # 2) перейти к следующему альбому и отправить ЕГО отдельным постом
+    # 2) send next album as a NEW post
     albums = get_albums(album_list)
-    # Find index of this rank in the DataFrame
     idx_series = albums.index[albums["rank"] == rank]
     if len(idx_series) == 0:
         return
@@ -447,7 +549,6 @@ async def rate_set(call: CallbackQuery):
 
 @router.callback_query(F.data == "ui:back")
 async def back(call: CallbackQuery):
-    # вернуть обычные кнопки (и показать текущую сохраненную оценку, если есть)
     album_list, idx = await get_user(call.from_user.id)
     albums = get_albums(album_list)
     if idx < 0 or idx >= len(albums):
