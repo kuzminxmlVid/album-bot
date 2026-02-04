@@ -824,12 +824,9 @@ async def cmd_set_cover(msg: Message):
     list_name, rank, url = _parse_set_cover_args(msg.text or "")
     if rank is None or not url:
         await msg.answer(
-            "Формат:
-"
-            "/set_cover 37 https://...jpg
-"
-            "или
-"
+            "Формат:\n"
+            "/set_cover 37 https://...jpg\n"
+            "или\n"
             "/set_cover top500 RS 412 https://...jpg"
         )
         return
@@ -863,12 +860,9 @@ async def cmd_del_cover(msg: Message):
     list_name, rank = _parse_del_cover_args(msg.text or "")
     if rank is None:
         await msg.answer(
-            "Формат:
-"
-            "/del_cover 37
-"
-            "или
-"
+            "Формат:\n"
+            "/del_cover 37\n"
+            "или\n"
             "/del_cover top500 RS 412"
         )
         return
