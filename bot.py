@@ -686,6 +686,69 @@ async def on_error(event):
         log.exception("Unhandled error (no exception)")
     return True
 
+# ================= MANUAL COVERS =================
+
+async def _is_image_url(url: str) -> bool:
+    """Lightweight check that URL returns image/* content-type."""
+    try:
+        await init_http()
+        async with _http().get(url, allow_redirects=True) as r:
+            if r.status != 200:
+                return False
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            return ctype.startswith("image/")
+    except Exception:
+        return False
+
+
+def _parse_set_cover_args(text: str) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Supports:
+      /set_cover <rank> <url>
+      /set_cover <list name...> <rank> <url>
+    Returns: (list_name_or_none, rank_or_none, url_or_none)
+    """
+    parts = (text or "").split()
+    if len(parts) < 3:
+        return None, None, None
+
+    if parts[1].isdigit():
+        try:
+            return None, int(parts[1]), parts[2]
+        except Exception:
+            return None, None, None
+
+    if len(parts) < 4 or not parts[-2].isdigit():
+        return None, None, None
+
+    list_name = " ".join(parts[1:-2]).strip()
+    try:
+        return list_name, int(parts[-2]), parts[-1]
+    except Exception:
+        return None, None, None
+
+
+def _parse_del_cover_args(text: str) -> tuple[Optional[str], Optional[int]]:
+    """Supports: /del_cover <rank>  OR  /del_cover <list name...> <rank>"""
+    parts = (text or "").split()
+    if len(parts) < 2:
+        return None, None
+
+    if parts[1].isdigit():
+        try:
+            return None, int(parts[1])
+        except Exception:
+            return None, None
+
+    if len(parts) < 3 or not parts[-1].isdigit():
+        return None, None
+
+    list_name = " ".join(parts[1:-1]).strip()
+    try:
+        return list_name, int(parts[-1])
+    except Exception:
+        return None, None
+
 # ================= COMMANDS =================
 
 @router.message(Command("start"))
@@ -746,6 +809,80 @@ async def cmd_set_list(msg: Message):
 async def cmd_export(msg: Message):
     data = await export_ratings_csv(msg.from_user.id)
     await msg.answer_document(BufferedInputFile(data, filename="ratings.csv"))
+
+@router.message(Command("set_cover"))
+async def cmd_set_cover(msg: Message):
+    """
+    Set manual cover URL for an album.
+    Usage:
+      /set_cover <rank> <url>
+      /set_cover <list name...> <rank> <url>
+    """
+    await init_http()
+    cur_list = await ensure_user(msg.from_user.id)
+
+    list_name, rank, url = _parse_set_cover_args(msg.text or "")
+    if rank is None or not url:
+        await msg.answer(
+            "Формат:
+"
+            "/set_cover 37 https://...jpg
+"
+            "или
+"
+            "/set_cover top500 RS 412 https://...jpg"
+        )
+        return
+
+    target_list = cur_list
+    if list_name:
+        resolved = resolve_list_name(list_name)
+        if not resolved:
+            await msg.answer("Не нашёл такой список. Набери /lists.")
+            return
+        target_list = resolved
+
+    if not await _is_image_url(url):
+        await msg.answer("Ссылка не выглядит как прямая картинка (Content-Type не image/*). Дай прямой URL на файл.")
+        return
+
+    await set_cached_cover(target_list, rank, url, "manual")
+    await msg.answer(f"Ок. Поставил обложку вручную: {target_list} #{rank}")
+
+
+@router.message(Command("del_cover"))
+async def cmd_del_cover(msg: Message):
+    """
+    Remove cached/manual cover so bot will re-fetch it.
+    Usage:
+      /del_cover <rank>
+      /del_cover <list name...> <rank>
+    """
+    cur_list = await ensure_user(msg.from_user.id)
+
+    list_name, rank = _parse_del_cover_args(msg.text or "")
+    if rank is None:
+        await msg.answer(
+            "Формат:
+"
+            "/del_cover 37
+"
+            "или
+"
+            "/del_cover top500 RS 412"
+        )
+        return
+
+    target_list = cur_list
+    if list_name:
+        resolved = resolve_list_name(list_name)
+        if not resolved:
+            await msg.answer("Не нашёл такой список. Набери /lists.")
+            return
+        target_list = resolved
+
+    await delete_cached_cover(target_list, rank)
+    await msg.answer(f"Ок. Удалил кэш обложки: {target_list} #{rank}")
 
 # ================= CALLBACKS =================
 
