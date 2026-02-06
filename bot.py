@@ -252,6 +252,17 @@ def get_albums(list_name: str) -> pd.DataFrame:
         album_cache[list_name] = load_albums(list_name)
     return album_cache[list_name]
 
+
+def find_index_by_rank(list_name: str, rank: int) -> Optional[int]:
+    albums = get_albums(list_name)
+    try:
+        idxs = albums.index[albums["rank"] == int(rank)].tolist()
+        if not idxs:
+            return None
+        return int(idxs[0])
+    except Exception:
+        return None
+
 # ================= USERS + PROGRESS =================
 
 async def ensure_user(user_id: int) -> str:
@@ -1136,6 +1147,49 @@ async def cmd_next_from(msg: Message):
         await msg.reply("Напиши мне в личные сообщения 🙂")
         return
     await init_http()
+
+
+@router.message(Command("go"))
+async def cmd_go(msg: Message):
+    """
+    Переход к конкретному альбому по ранку.
+    Примеры:
+      /go 37
+      /go top500 RS 412
+    """
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.answer("Напиши так: /go 37\nИли так: /go top500 RS 412")
+        return
+
+    try:
+        rank = int(parts[-1])
+    except ValueError:
+        await msg.answer("Не понял rank. Пример: /go 37 или /go top500 RS 412")
+        return
+
+    if len(parts) == 2:
+        album_list = await get_selected_list(msg.from_user.id)
+    else:
+        list_name = " ".join(parts[1:-1])
+        resolved = resolve_list_name(list_name)
+        if not resolved:
+            await msg.answer("Не нашёл такой список. Набери /lists", reply_markup=lists_keyboard())
+            return
+        album_list = resolved
+
+    idx = find_index_by_rank(album_list, rank)
+    if idx is None:
+        await msg.answer(f"Не нашёл альбом #{rank} в списке {album_list}.")
+        return
+
+    await send_album_post(
+        msg.from_user.id,
+        album_list,
+        idx,
+        ctx="jump",
+        prefix=f"🎯 Переход к альбому #{rank}\nСписок: <b>{album_list}</b>",
+    )
 
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
