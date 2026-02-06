@@ -163,6 +163,34 @@ def canonical_list_name(name: str) -> str:
 def encode_list_name(name: str) -> str:
     return quote(canonical_list_name(name), safe="")
 
+
+
+def get_list_intro(list_name: str) -> Optional[str]:
+    """
+    Возвращает приветственную фразу для списка (если задана).
+    Источники (по приоритету):
+    1) Файл albums/<list_name>.intro.txt (можно добавлять без изменения кода)
+    2) Словарь LIST_INTROS в коде (для базовых списков)
+    """
+    # 1) Intro-файл рядом со списком
+    try:
+        intro_path = os.path.join(Config.ALBUMS_DIR, f"{list_name}.intro.txt")
+        if os.path.exists(intro_path):
+            txt = Path(intro_path).read_text(encoding="utf-8").strip()
+            return txt or None
+    except Exception as e:
+        log.debug("intro file read failed: %s", e)
+
+    # 2) Встроенные интро (опционально)
+    return LIST_INTROS.get(list_name)
+
+
+# Можно задать тексты здесь для конкретных списков
+# Или (лучше) положить рядом с xlsx файл: albums/<имя_списка>.intro.txt
+LIST_INTROS: Dict[str, str] = {
+    # "top100": "Тут можешь написать вводный текст для top100",
+    # "top500 RS": "Rolling Stone Top 500. Тут можно написать правила/контекст.",
+}
 def list_file_names() -> List[str]:
     if not os.path.isdir(Config.ALBUMS_DIR):
         return []
@@ -627,16 +655,19 @@ async def toggle_daily(user_id: int) -> bool:
         )
         return new_state
 
-def daily_pick_index(list_name: str, for_date: date) -> int:
+def daily_pick_index(list_name: str, for_date: date, user_id: int) -> int:
     albums = get_albums(list_name)
     if len(albums) == 0:
         return -1
     days = (for_date - date(2020, 1, 1)).days
-    offset = days % len(albums)
+    # Stable per-user salt so "album of the day" differs across users but is deterministic.
+    salt = (user_id * 1103515245 + 12345) & 0x7fffffff
+    offset = (days + salt) % len(albums)
+    # Keep the same direction as the main flow: from the end towards the beginning.
     return (len(albums) - 1) - offset
 
 async def send_daily_album_to(user_id: int, list_name: str, today: date) -> None:
-    idx = daily_pick_index(list_name, today)
+    idx = daily_pick_index(list_name, today, user_id)
     prefix = f"☀️ <b>Альбом дня</b> ({today.isoformat()})\nСписок: <b>{list_name}</b>"
     await send_album_post(user_id, list_name, idx, ctx="daily", prefix=prefix)
 
@@ -764,6 +795,7 @@ async def cmd_start(msg: Message):
         "Меню: /menu\n"
         "Списки: /lists\n"
         "Статистика: /stats\n"
+        "Альбом из другого списка: /next_from <название>\n"
     )
     await msg.answer(text, reply_markup=menu_keyboard())
 
@@ -775,6 +807,9 @@ async def cmd_start_albums(msg: Message):
     await init_http()
     album_list = await ensure_user(msg.from_user.id)
     idx = await get_index(msg.from_user.id, album_list)
+    intro = get_list_intro(album_list)
+    if intro:
+        await msg.answer(intro)
     await send_album_post(msg.from_user.id, album_list, idx, ctx="flow")
 
 @router.message(Command("menu"))
@@ -803,8 +838,44 @@ async def cmd_set_list(msg: Message):
         return
     idx = await get_index(msg.from_user.id, resolved)
     await msg.answer(f"Ок. Список: {resolved}")
+    intro = get_list_intro(resolved)
+    if intro:
+        await msg.answer(intro)
     await send_album_post(msg.from_user.id, resolved, idx, ctx="flow")
 
+
+
+
+@router.message(Command("next_from"))
+async def cmd_next_from(msg: Message):
+    """Show the next album from another list without switching the current list."""
+    if msg.chat.type != "private":
+        await msg.reply("Напиши мне в личные сообщения 🙂")
+        return
+    await init_http()
+
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("Напиши так: /next_from top500 RS", reply_markup=lists_keyboard())
+        return
+
+    target = parts[1].strip()
+    resolved = resolve_list_name(target)
+    if not resolved:
+        await msg.answer("Не нашёл такой список. Набери /lists", reply_markup=lists_keyboard())
+        return
+
+    user_id = msg.from_user.id
+    idx = await get_index(user_id, resolved)
+
+    await send_album_post(
+        user_id,
+        resolved,
+        idx,
+        ctx="from_other",
+        prefix=f"↪️ Из списка: <b>{resolved}</b>",
+    )
+    await set_index(user_id, resolved, idx - 1)
 @router.message(Command("export_ratings"))
 async def cmd_export(msg: Message):
     data = await export_ratings_csv(msg.from_user.id)
@@ -940,6 +1011,9 @@ async def setlist_cb(call: CallbackQuery):
         return
     idx = await get_index(call.from_user.id, resolved)
     await call.answer(f"Список: {resolved}")
+    intro = get_list_intro(resolved)
+    if intro:
+        await call.message.answer(intro)
     await send_album_post(call.from_user.id, resolved, idx, ctx="flow")
 
 @router.callback_query(F.data == "ui:daily")
