@@ -134,6 +134,16 @@ async def init_pg() -> None:
         )
         """)
 
+
+await conn.execute("""
+CREATE TABLE IF NOT EXISTS songlinks (
+    album_list TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    songlink_url TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (album_list, rank)
+)
+""")
         try:
             await conn.execute("ALTER TABLE covers ALTER COLUMN updated_at SET DEFAULT NOW()")
         except Exception:
@@ -393,6 +403,30 @@ async def delete_cached_cover(album_list: str, rank: int) -> None:
     async with _pool().acquire() as conn:
         await conn.execute("DELETE FROM covers WHERE album_list=$1 AND rank=$2", album_list, rank)
 
+
+async def get_cached_songlink(album_list: str, rank: int) -> Optional[str]:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT songlink_url FROM songlinks WHERE album_list=$1 AND rank=$2",
+            album_list, rank
+        )
+        return row["songlink_url"] if row else None
+
+async def set_cached_songlink(album_list: str, rank: int, songlink_url: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO songlinks (album_list, rank, songlink_url, updated_at) "
+            "VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (album_list, rank) "
+            "DO UPDATE SET songlink_url=EXCLUDED.songlink_url, updated_at=EXCLUDED.updated_at",
+            album_list, rank, songlink_url, now
+        )
+
+async def delete_cached_songlink(album_list: str, rank: int) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute("DELETE FROM songlinks WHERE album_list=$1 AND rank=$2", album_list, rank)
+
 async def cover_from_itunes(artist: str, album: str) -> Optional[str]:
     try:
         async with _http().get(
@@ -404,6 +438,53 @@ async def cover_from_itunes(artist: str, album: str) -> Optional[str]:
                 return data["results"][0]["artworkUrl100"].replace("100x100", "600x600")
     except Exception as e:
         log.debug("itunes cover failed: %s", e)
+    return None
+
+
+async def itunes_album_url(artist: str, album: str) -> Optional[str]:
+    """Return iTunes/Apple Music album URL (collectionViewUrl)."""
+    try:
+        async with _http().get(
+            "https://itunes.apple.com/search",
+            params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
+        ) as r:
+            data = await r.json(content_type=None)
+            if data.get("resultCount"):
+                return data["results"][0].get("collectionViewUrl")
+    except Exception as e:
+        log.debug("itunes album url failed: %s", e)
+    return None
+
+async def songlink_page_url_from_any(url: str) -> Optional[str]:
+    """Get universal song.link pageUrl for a given platform URL."""
+    try:
+        async with _http().get(
+            "https://api.song.link/v1-alpha.1/links",
+            params={"url": url},
+        ) as r:
+            if r.status != 200:
+                return None
+            data = await r.json(content_type=None)
+            page = data.get("pageUrl")
+            if isinstance(page, str) and page.startswith("http"):
+                return page
+    except Exception as e:
+        log.debug("song.link api failed: %s", e)
+    return None
+
+async def get_songlink_url(album_list: str, rank: int, artist: str, album: str) -> Optional[str]:
+    cached = await get_cached_songlink(album_list, rank)
+    if cached:
+        return cached
+
+    it_url = await itunes_album_url(artist, album)
+    if not it_url:
+        return None
+
+    page = await songlink_page_url_from_any(it_url)
+    if page:
+        await set_cached_songlink(album_list, rank, page)
+        return page
     return None
 
 async def cover_from_deezer(artist: str, album: str) -> Optional[str]:
@@ -597,7 +678,7 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
     rel_text = "🔁 Переслушаю ✅" if in_relisten else "🔁 Переслушаю"
     enc = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎧 Найти альбом", url=google_link(artist, album))],
+        [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
         [
             InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
             InlineKeyboardButton(text="Пропустить", callback_data="nav:next"),
@@ -1142,12 +1223,34 @@ async def cmd_set_list(msg: Message):
 
 @router.message(Command("next_from"))
 async def cmd_next_from(msg: Message):
-    """Show the next album from another list without switching the current list."""
+    """Показать следующий альбом из другого списка, не переключая текущий."""
     if msg.chat.type != "private":
         await msg.reply("Напиши мне в личные сообщения 🙂")
         return
     await init_http()
 
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("Напиши так: /next_from top500 RS", reply_markup=lists_keyboard())
+        return
+
+    target = parts[1].strip()
+    resolved = resolve_list_name(target)
+    if not resolved:
+        await msg.answer("Не нашёл такой список. Набери /lists", reply_markup=lists_keyboard())
+        return
+
+    user_id = msg.from_user.id
+    # Берём текущий индекс по выбранному списку и увеличиваем его на 1 в рамках target-списка
+    idx = await get_index(user_id, resolved)
+    await send_album_post(
+        user_id,
+        resolved,
+        idx,
+        ctx="from_other",
+        prefix=f"↪️ Из списка: <b>{resolved}</b>",
+    )
+    await set_index(user_id, resolved, idx - 1)
 
 @router.message(Command("go"))
 async def cmd_go(msg: Message):
@@ -1157,9 +1260,14 @@ async def cmd_go(msg: Message):
       /go 37
       /go top500 RS 412
     """
+    if msg.chat.type != "private":
+        await msg.reply("Напиши мне в личные сообщения 🙂")
+        return
+
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        await msg.answer("Напиши так: /go 37\nИли так: /go top500 RS 412")
+        await msg.answer("Напиши так: /go 37
+Или так: /go top500 RS 412")
         return
 
     try:
@@ -1188,31 +1296,11 @@ async def cmd_go(msg: Message):
         album_list,
         idx,
         ctx="jump",
-        prefix=f"🎯 Переход к альбому #{rank}\nСписок: <b>{album_list}</b>",
+        prefix=f"🎯 Переход к альбому #{rank}
+Список: <b>{album_list}</b>",
     )
 
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await msg.answer("Напиши так: /next_from top500 RS", reply_markup=lists_keyboard())
-        return
 
-    target = parts[1].strip()
-    resolved = resolve_list_name(target)
-    if not resolved:
-        await msg.answer("Не нашёл такой список. Набери /lists", reply_markup=lists_keyboard())
-        return
-
-    user_id = msg.from_user.id
-    idx = await get_index(user_id, resolved)
-
-    await send_album_post(
-        user_id,
-        resolved,
-        idx,
-        ctx="from_other",
-        prefix=f"↪️ Из списка: <b>{resolved}</b>",
-    )
-    await set_index(user_id, resolved, idx - 1)
 @router.message(Command("export_ratings"))
 async def cmd_export(msg: Message):
     data = await export_ratings_csv(msg.from_user.id)
