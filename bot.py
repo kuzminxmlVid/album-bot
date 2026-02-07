@@ -1664,7 +1664,7 @@ async def rate_ui(call: CallbackQuery):
         return
     row = rows.iloc[0]
     artist = str(row["artist"])
-    album = str(row["album"])
+    album = str(row["album"])    
     genre = str(row.get("genre", "") or "")
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
     caption = album_caption(rank, artist, album, genre, current_rating)
