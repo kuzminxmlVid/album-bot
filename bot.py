@@ -1093,6 +1093,51 @@ def _parse_del_cover_args(text: str) -> tuple[Optional[str], Optional[int]]:
     if len(parts) < 2:
         return None, None
 
+
+def _is_songlink_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    return ("song.link" in u) or ("odesli.co" in u)
+
+def _parse_set_songlink_args(text: str) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Returns (list_name or None, rank or None, url or None)
+    Supported:
+      /set_songlink 37 https://song.link/...
+      /set_songlink top500 RS 412 https://song.link/...
+    """
+    parts = (text or "").split()
+    if len(parts) < 3:
+        return None, None, None
+    url = parts[-1]
+    try:
+        rank = int(parts[-2])
+    except ValueError:
+        return None, None, None
+    list_name = None
+    if len(parts) > 3:
+        list_name = " ".join(parts[1:-2])
+    return list_name, rank, url
+
+def _parse_del_songlink_args(text: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Supported:
+      /del_songlink 37
+      /del_songlink top500 RS 412
+    """
+    parts = (text or "").split()
+    if len(parts) < 2:
+        return None, None
+    try:
+        rank = int(parts[-1])
+    except ValueError:
+        return None, None
+    list_name = None
+    if len(parts) > 2:
+        list_name = " ".join(parts[1:-1])
+    return list_name, rank
+
     if parts[1].isdigit():
         try:
             return None, int(parts[1])
@@ -1342,6 +1387,73 @@ async def cmd_del_cover(msg: Message):
       /del_cover <list name...> <rank>
     """
     cur_list = await ensure_user(msg.from_user.id)
+
+
+@router.message(Command("set_songlink"))
+async def cmd_set_songlink(msg: Message):
+    """
+    Manually set song.link URL for an album.
+    Usage:
+      /set_songlink <rank> <song.link url>
+      /set_songlink <list name...> <rank> <song.link url>
+    """
+    cur_list = await ensure_user(msg.from_user.id)
+
+    list_name, rank, url = _parse_set_songlink_args(msg.text or "")
+    if rank is None or not url:
+        await msg.answer(
+            "Формат:\n"
+            "/set_songlink 37 https://song.link/...\n"
+            "или\n"
+            "/set_songlink top500 RS 412 https://song.link/..."
+        )
+        return
+
+    if not _is_songlink_url(url):
+        await msg.answer("Ссылка должна быть song.link или odesli.co и начинаться с http(s).")
+        return
+
+    target_list = cur_list
+    if list_name:
+        resolved = resolve_list_name(list_name)
+        if not resolved:
+            await msg.answer("Не нашёл такой список. Набери /lists.")
+            return
+        target_list = resolved
+
+    await set_cached_songlink(target_list, rank, url)
+    await msg.answer(f"Ок. Поставил song.link: {target_list} #{rank}")
+
+@router.message(Command("del_songlink"))
+async def cmd_del_songlink(msg: Message):
+    """
+    Remove cached/manual song.link so bot will re-fetch it.
+    Usage:
+      /del_songlink <rank>
+      /del_songlink <list name...> <rank>
+    """
+    cur_list = await ensure_user(msg.from_user.id)
+
+    list_name, rank = _parse_del_songlink_args(msg.text or "")
+    if rank is None:
+        await msg.answer(
+            "Формат:\n"
+            "/del_songlink 37\n"
+            "или\n"
+            "/del_songlink top500 RS 412"
+        )
+        return
+
+    target_list = cur_list
+    if list_name:
+        resolved = resolve_list_name(list_name)
+        if not resolved:
+            await msg.answer("Не нашёл такой список. Набери /lists.")
+            return
+        target_list = resolved
+
+    await delete_cached_songlink(target_list, rank)
+    await msg.answer(f"Ок. Удалил кэш song.link: {target_list} #{rank}")
 
     list_name, rank = _parse_del_cover_args(msg.text or "")
     if rank is None:
