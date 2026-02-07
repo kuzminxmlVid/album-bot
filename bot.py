@@ -135,31 +135,21 @@ async def init_pg() -> None:
         """)
 
 
-await conn.execute("""
-CREATE TABLE IF NOT EXISTS songlinks (
-    album_list TEXT NOT NULL,
-    rank INTEGER NOT NULL,
-    songlink_url TEXT NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (album_list, rank)
-)
-""")
-        try:
-            await conn.execute("ALTER TABLE covers ALTER COLUMN updated_at SET DEFAULT NOW()")
-        except Exception:
-            pass
-
-        
-        # relisten list ("Переслушаю")
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS relisten (
-            user_id BIGINT NOT NULL,
+        CREATE TABLE IF NOT EXISTS songlinks (
             album_list TEXT NOT NULL,
             rank INTEGER NOT NULL,
-            added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (user_id, album_list, rank)
+            songlink_url TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (album_list, rank)
         )
         """)
+
+        # Ensure defaults for caches
+        try:
+            await conn.execute("ALTER TABLE songlinks ALTER COLUMN updated_at SET DEFAULT NOW()")
+        except Exception:
+            pass
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_relisten_user
         ON relisten (user_id, added_at DESC)
@@ -1266,8 +1256,7 @@ async def cmd_go(msg: Message):
 
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        await msg.answer("Напиши так: /go 37
-Или так: /go top500 RS 412")
+        await msg.answer("Напиши так: /go 37\nИли так: /go top500 RS 412")
         return
 
     try:
@@ -1296,8 +1285,7 @@ async def cmd_go(msg: Message):
         album_list,
         idx,
         ctx="jump",
-        prefix=f"🎯 Переход к альбому #{rank}
-Список: <b>{album_list}</b>",
+        prefix=f"🎯 Переход к альбому #{rank}\nСписок: <b>{album_list}</b>",
     )
 
 
