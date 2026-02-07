@@ -1098,7 +1098,7 @@ def _is_songlink_url(url: str) -> bool:
     u = (url or "").strip().lower()
     if not (u.startswith("http://") or u.startswith("https://")):
         return False
-    return ("song.link" in u) or ("odesli.co" in u)
+    return ("song.link" in u) or ("odesli.co" in u) or ("album.link" in u)
 
 def _parse_set_songlink_args(text: str) -> tuple[Optional[str], Optional[int], Optional[str]]:
     """
@@ -1410,7 +1410,7 @@ async def cmd_set_songlink(msg: Message):
         return
 
     if not _is_songlink_url(url):
-        await msg.answer("Ссылка должна быть song.link или odesli.co и начинаться с http(s).")
+        await msg.answer("Ссылка должна быть song.link, album.link или odesli.co и начинаться с http(s).")
         return
 
     target_list = cur_list
@@ -1664,7 +1664,7 @@ async def rate_ui(call: CallbackQuery):
         return
     row = rows.iloc[0]
     artist = str(row["artist"])
-    album = str(row["album"])    
+    album = str(row["album"])
     genre = str(row.get("genre", "") or "")
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
     caption = album_caption(rank, artist, album, genre, current_rating)
