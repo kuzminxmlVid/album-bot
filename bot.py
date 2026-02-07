@@ -663,7 +663,7 @@ def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: O
         f"{relisten_line}"
     )
 
-def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, *, in_relisten: bool = False) -> InlineKeyboardMarkup:
+def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, listen_url: Optional[str], *, in_relisten: bool = False) -> InlineKeyboardMarkup:
     rate_text = "⭐ Оценить" if not rated else f"⭐ Оценено: {rated}"
     rel_text = "🔁 Переслушаю ✅" if in_relisten else "🔁 Переслушаю"
     enc = encode_list_name(album_list)
@@ -742,7 +742,8 @@ async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix
     cover = await get_cover_with_fallback(album_list, rank, artist, album)
     in_rel = await is_relisten(user_id, album_list, rank)
     caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix)
-    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, in_relisten=in_rel)
+    listen_url = await get_songlink_url(album_list, rank, artist, album)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel)
     return cover, caption, kb, rank, user_rating, artist, album, genre
 
 async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "flow", prefix: str = "") -> None:
@@ -783,7 +784,8 @@ async def edit_album_post(call: CallbackQuery, album_list: str, rank: int, ctx: 
     user_rating = await get_user_rating(call.from_user.id, album_list, rank)
     in_rel = await is_relisten(call.from_user.id, album_list, rank)
     caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix)
-    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, in_relisten=in_rel)
+    listen_url = await get_songlink_url(album_list, rank, artist, album)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel)
 
     try:
         if call.message.photo:
@@ -1486,7 +1488,8 @@ async def relisten_toggle_cb(call: CallbackQuery):
     genre = str(row.get("genre", "") or "")
     ur = await get_user_rating(call.from_user.id, album_list, rank)
     caption = album_caption(rank, artist, album, genre, ur, in_relisten=enabled)
-    kb = album_keyboard(album_list, rank, artist, album, ur, ctx, in_relisten=enabled)
+    listen_url = await get_songlink_url(album_list, rank, artist, album)
+    kb = album_keyboard(album_list, rank, artist, album, ur, ctx, listen_url, in_relisten=enabled)
 
     try:
         if call.message.photo:
