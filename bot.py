@@ -57,6 +57,33 @@ if not Config.TOKEN or not Config.DATABASE_URL:
 if Config.DATABASE_URL.startswith("postgres://"):
     Config.DATABASE_URL = Config.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+
+# ================= AI (OpenAI) =================
+
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+AI_MAX_DAILY_DEFAULT = 15
+AI_CACHE_DAYS_DEFAULT = 30
+
+def _ai_max_daily() -> int:
+    try:
+        return int(os.getenv("AI_MAX_DAILY", str(AI_MAX_DAILY_DEFAULT)))
+    except Exception:
+        return AI_MAX_DAILY_DEFAULT
+
+def _ai_cache_days() -> int:
+    try:
+        return int(os.getenv("AI_CACHE_DAYS", str(AI_CACHE_DAYS_DEFAULT)))
+    except Exception:
+        return AI_CACHE_DAYS_DEFAULT
+
+AI_MODE_LIMITS = {
+    "short": 220,
+    "long": 650,
+    "sound": 750,
+}
+
 # ================= BOT =================
 
 bot = Bot(token=Config.TOKEN)
@@ -145,6 +172,26 @@ async def init_pg() -> None:
         )
         """)
 
+
+await conn.execute("""
+CREATE TABLE IF NOT EXISTS ai_notes (
+    album_list TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    text TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (album_list, rank, mode)
+)
+""")
+
+await conn.execute("""
+CREATE TABLE IF NOT EXISTS ai_usage (
+    user_id BIGINT NOT NULL,
+    day DATE NOT NULL,
+    cnt INTEGER NOT NULL,
+    PRIMARY KEY (user_id, day)
+)
+""")
         # Ensure defaults for caches
         try:
             await conn.execute("ALTER TABLE songlinks ALTER COLUMN updated_at SET DEFAULT NOW()")
@@ -417,6 +464,60 @@ async def delete_cached_songlink(album_list: str, rank: int) -> None:
     async with _pool().acquire() as conn:
         await conn.execute("DELETE FROM songlinks WHERE album_list=$1 AND rank=$2", album_list, rank)
 
+
+async def get_cached_ai_note(album_list: str, rank: int, mode: str) -> Optional[str]:
+    """Return cached AI text if fresh enough."""
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT text, updated_at FROM ai_notes WHERE album_list=$1 AND rank=$2 AND mode=$3",
+            album_list, rank, mode
+        )
+        if not row:
+            return None
+        updated_at = row["updated_at"]
+        if not updated_at:
+            return None
+        max_age_days = _ai_cache_days()
+        if max_age_days > 0:
+            age = datetime.now(timezone.utc) - updated_at
+            if age > timedelta(days=max_age_days):
+                return None
+        return row["text"]
+
+async def set_cached_ai_note(album_list: str, rank: int, mode: str, text: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO ai_notes (album_list, rank, mode, text, updated_at) "
+            "VALUES ($1,$2,$3,$4,$5) "
+            "ON CONFLICT (album_list, rank, mode) "
+            "DO UPDATE SET text=EXCLUDED.text, updated_at=EXCLUDED.updated_at",
+            album_list, rank, mode, text, now
+        )
+
+async def _ai_usage_today_key() -> date:
+    return datetime.now(timezone.utc).date()
+
+async def get_ai_usage_today(user_id: int) -> int:
+    d = await _ai_usage_today_key()
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT cnt FROM ai_usage WHERE user_id=$1 AND day=$2",
+            int(user_id), d
+        )
+        return int(row["cnt"]) if row else 0
+
+async def inc_ai_usage_today(user_id: int) -> int:
+    d = await _ai_usage_today_key()
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO ai_usage (user_id, day, cnt) VALUES ($1,$2,1) "
+            "ON CONFLICT (user_id, day) DO UPDATE SET cnt=ai_usage.cnt+1 "
+            "RETURNING cnt",
+            int(user_id), d
+        )
+        return int(row["cnt"]) if row else 1
+
 async def cover_from_itunes(artist: str, album: str) -> Optional[str]:
     try:
         async with _http().get(
@@ -466,6 +567,103 @@ async def get_songlink_url(album_list: str, rank: int, artist: str, album: str) 
     cached = await get_cached_songlink(album_list, rank)
     if cached:
         return cached
+
+
+def _extract_response_text(data: dict) -> str:
+    if isinstance(data, dict):
+        ot = data.get("output_text")
+        if isinstance(ot, str) and ot.strip():
+            return ot.strip()
+        out = data.get("output")
+        if isinstance(out, list):
+            parts = []
+            for item in out:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "message":
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "output_text":
+                            t = c.get("text")
+                            if isinstance(t, str):
+                                parts.append(t)
+            text = "".join(parts).strip()
+            if text:
+                return text
+    return ""
+
+def _ai_system_prompt(mode: str) -> str:
+    base = (
+        "Ты помощник в телеграм-боте с музыкальными альбомами. "
+        "Пиши по-русски. "
+        "Не выдумывай факты (год, лейбл, награды, места в чартах, участники записи). "
+        "Если не уверен — прямо так и скажи. "
+        "Без маркетинговых клише и без воды."
+    )
+    if mode == "sound":
+        return base + " Фокус на продакшне, аранжировке, звучании, миксе и динамике."
+    return base
+
+def _ai_user_prompt(mode: str, artist: str, album: str) -> str:
+    if mode == "short":
+        return (
+            f"Альбом: {artist} — {album}.\n"
+            "Сделай краткую справку 5–7 строк: контекст, чем интересен, с чего начать слушать. "
+            "Без дат/наград если не уверен."
+        )
+    if mode == "long":
+        return (
+            f"Альбом: {artist} — {album}.\n"
+            "Сделай развернутую справку 15–25 строк. "
+            "Контекст и место в творчестве. "
+            "Не придумывай факты, если не уверен — отметь это."
+        )
+    return (
+        f"Альбом: {artist} — {album}.\n"
+        "Сделай разбор про звук 10–18 строк. "
+        "На что обратить внимание: тембр, пространство, динамика, плотность, низ/верх, "
+        "решения аранжировки и микса. "
+        "Не придумывай факты о студиях/инженерах/оборудовании."
+    )
+
+async def openai_generate_album_note(mode: str, artist: str, album: str) -> Optional[str]:
+    if not OPENAI_API_KEY:
+        return None
+    mode = mode.strip().lower()
+    if mode not in AI_MODE_LIMITS:
+        return None
+    max_out = AI_MODE_LIMITS[mode]
+    payload = {
+        "model": AI_MODEL,
+        "input": [
+            {"role": "system", "content": _ai_system_prompt(mode)},
+            {"role": "user", "content": _ai_user_prompt(mode, artist, album)},
+        ],
+        "max_output_tokens": max_out,
+        "store": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with _http().post(
+            "https://api.openai.com/v1/responses",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        ) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                log.warning("openai error %s: %s", r.status, str(data)[:500])
+                return None
+            text = _extract_response_text(data)
+            return text.strip() if text else None
+    except Exception as e:
+        log.exception("openai request failed: %s", e)
+        return None
 
     it_url = await itunes_album_url(artist, album)
     if not it_url:
@@ -669,6 +867,7 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
     enc = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
+            [InlineKeyboardButton(text="🧠 AI", callback_data=f"ai:menu:{album_list}:{rank}")],
         [
             InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
             InlineKeyboardButton(text="Пропустить", callback_data="nav:next"),
@@ -1740,6 +1939,108 @@ async def on_shutdown() -> None:
         await http_session.close()
     if pg_pool:
         await pg_pool.close()
+
+_ai_user_locks: dict[int, asyncio.Lock] = {}
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _ai_user_locks.get(int(user_id))
+    if not lock:
+        lock = asyncio.Lock()
+        _ai_user_locks[int(user_id)] = lock
+    return lock
+
+def ai_menu_keyboard(album_list: str, rank: int) -> InlineKeyboardMarkup:
+    kb = [
+        [
+            InlineKeyboardButton(text="🧠 Коротко", callback_data=f"ai:short:{album_list}:{rank}"),
+            InlineKeyboardButton(text="📚 Подробно", callback_data=f"ai:long:{album_list}:{rank}"),
+        ],
+        [
+            InlineKeyboardButton(text="🎚 Про звук", callback_data=f"ai:sound:{album_list}:{rank}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def _album_by_rank(album_list: str, rank: int) -> Optional[dict]:
+    idx = find_index_by_rank(album_list, int(rank))
+    if idx is None:
+        return None
+    df = get_albums(album_list)
+    row = df.iloc[int(idx)]
+    return {"artist": str(row["artist"]), "album": str(row["album"])}
+
+@router.callback_query(lambda c: c.data and c.data.startswith("ai:menu:"))
+async def ai_menu(call: CallbackQuery):
+    try:
+        _, _, album_list, rank_s = call.data.split(":", 3)
+        rank = int(rank_s)
+    except Exception:
+        await call.answer("Ошибка AI-меню", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer("Выбери режим AI:", reply_markup=ai_menu_keyboard(album_list, rank))
+
+@router.callback_query(lambda c: c.data and (c.data.startswith("ai:short:") or c.data.startswith("ai:long:") or c.data.startswith("ai:sound:")))
+async def ai_generate(call: CallbackQuery):
+    await call.answer()
+    try:
+        _, mode, album_list, rank_s = call.data.split(":", 3)
+        rank = int(rank_s)
+    except Exception:
+        await call.message.answer("Не понял запрос.")
+        return
+
+    if not OPENAI_API_KEY:
+        await call.message.answer("AI не настроен. Добавь переменную OPENAI_API_KEY в Railway.")
+        return
+
+    info = await _album_by_rank(album_list, rank)
+    if not info:
+        await call.message.answer("Не нашёл этот альбом в списке.")
+        return
+
+    cached = await get_cached_ai_note(album_list, rank, mode)
+    if cached:
+        title = {"short": "🧠 Коротко", "long": "📚 Подробно", "sound": "🎚 Про звук"}.get(mode, "🧠 AI")
+        await call.message.answer(
+            f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(cached)}",
+            parse_mode="HTML",
+        )
+        return
+
+    used = await get_ai_usage_today(call.from_user.id)
+    limit = _ai_max_daily()
+    if used >= limit:
+        await call.message.answer(f"Лимит AI на сегодня: {limit}. Попробуй завтра.")
+        return
+
+    lock = _get_user_lock(call.from_user.id)
+    async with lock:
+        cached2 = await get_cached_ai_note(album_list, rank, mode)
+        if cached2:
+            title = {"short": "🧠 Коротко", "long": "📚 Подробно", "sound": "🎚 Про звук"}.get(mode, "🧠 AI")
+            await call.message.answer(
+                f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(cached2)}",
+                parse_mode="HTML",
+            )
+            return
+
+        await inc_ai_usage_today(call.from_user.id)
+
+        thinking = await call.message.answer("⏳ Думаю...")
+        text = await openai_generate_album_note(mode, info["artist"], info["album"])
+        if not text:
+            await thinking.edit_text("Не получилось получить ответ AI. Попробуй позже.")
+            return
+
+        await set_cached_ai_note(album_list, rank, mode, text)
+
+        title = {"short": "🧠 Коротко", "long": "📚 Подробно", "sound": "🎚 Про звук"}.get(mode, "🧠 AI")
+        await thinking.edit_text(
+            f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(text)}",
+            parse_mode="HTML",
+        )
+
 
 async def main():
     global daily_task
