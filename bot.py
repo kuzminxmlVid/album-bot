@@ -4,6 +4,8 @@ import csv
 import io
 import asyncio
 import logging
+
+BOT_VERSION = "v31-2026-02-08_185954-06182358"
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -2042,7 +2044,13 @@ async def ai_generate(call: CallbackQuery):
         )
 
 
+@router.message(Command("version"))
+async def cmd_version(msg: Message):
+    await msg.answer(f"Версия бота: {BOT_VERSION}")
+
+
 async def main():
+    log.info("Bot version: %s", BOT_VERSION)
     global daily_task
     await init_pg()
     await init_http()
