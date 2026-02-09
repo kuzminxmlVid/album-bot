@@ -7,8 +7,8 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v54-2026-02-09_184805-76f9d44d")
-AI_CACHE_VERSION = 3  # bump to invalidate old AI cache
+BOT_VERSION = os.getenv("BOT_VERSION", "v55-2026-02-09_190821-7fd0f276")
+AI_CACHE_VERSION = 5  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -619,37 +619,64 @@ def _ai_system_prompt_note() -> str:
 
 def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
     return (
-        "Сделай биографическую справку об исполнителе. "
-        "Формат:\n"
-        "Кто это: (1–2 предложения)\n"
-        "Ключевые факты: (маркированно)\n"
-        "Жанры/теги: \n"
-        "Ссылки: (Wikipedia url если есть)\n\n"
+        "Сделай короткую справку об исполнителе. "
+        "Используй ТОЛЬКО факты из входных данных (Last.fm / Wikipedia / MusicBrainz). "
+        "Нельзя выдумывать. Нельзя добавлять ссылки. "
+        "Если данных нет — пиши 'нет данных'.\n\n"
+        "Верни СТРОГО 4 строки, без лишнего текста:\n"
+        "IDEA: ...\n"
+        "SOUND: ...\n"
+        "THEMES: ...\n"
+        "FEATURE: ...\n\n"
         "ВХОДНЫЕ ДАННЫЕ (MusicBrainz JSON):\n"
         f"{json.dumps(facts, ensure_ascii=False)}\n\n"
         "ВХОДНЫЕ ДАННЫЕ (Wikipedia summary):\n"
-        f"title: {wiki.get('title')}\n"
-        f"extract: {wiki.get('extract')}\n"
-        f"url: {wiki.get('url')}\n"
+        f"title: {(wiki or {}).get('title')}\n"
+        f"extract: {(wiki or {}).get('extract')}\n\n"
+        "ВХОДНЫЕ ДАННЫЕ (Last.fm):\n"
+        f"{json.dumps(lastfm, ensure_ascii=False)}\n"
     )
 
 def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
     return (
-        "Сделай справку об альбоме. "
-        "Формат:\n"
-        "Что это за релиз: (1–2 предложения)\n"
-        "Факты: дата первого релиза, тип, лейбл, теги\n"
-        "Треклист: (если есть, до 10)\n"
-        "Гости/история создания: ТОЛЬКО если прямо сказано во входных данных, иначе 'нет данных'\n"
-        "Ссылки: (song.link/album.link если есть, Wikipedia url если есть)\n\n"
+        "Сделай короткую справку об альбоме. "
+        "Используй ТОЛЬКО факты из входных данных (Last.fm / Wikipedia / MusicBrainz). "
+        "Нельзя выдумывать. Нельзя добавлять ссылки, дату релиза, лейбл, тип релиза, треклист. "
+        "Если данных нет — пиши 'нет данных'.\n\n"
+        "Верни СТРОГО 4 строки, без лишнего текста:\n"
+        "IDEA: ...\n"
+        "SOUND: ...\n"
+        "THEMES: ...\n"
+        "FEATURE: ...\n\n"
         "ВХОДНЫЕ ДАННЫЕ (MusicBrainz JSON):\n"
         f"{json.dumps(facts, ensure_ascii=False)}\n\n"
         "ВХОДНЫЕ ДАННЫЕ (Wikipedia summary):\n"
-        f"title: {wiki.get('title')}\n"
-        f"extract: {wiki.get('extract')}\n"
-        f"url: {wiki.get('url')}\n"
+        f"title: {(wiki or {}).get('title')}\n"
+        f"extract: {(wiki or {}).get('extract')}\n\n"
+        "ВХОДНЫЕ ДАННЫЕ (Last.fm):\n"
+        f"{json.dumps(lastfm, ensure_ascii=False)}\n"
     )
 
+def parse_ai_brief(text: str) -> dict:
+    """Parse 4-line structured AI output."""
+    out = {"idea": "нет данных", "sound": "нет данных", "themes": "нет данных", "feature": "нет данных"}
+    if not text:
+        return out
+    for line in text.splitlines():
+        m = re.match(r"^\s*(IDEA|SOUND|THEMES|FEATURE)\s*:\s*(.*)\s*$", line, re.I)
+        if not m:
+            continue
+        key = m.group(1).upper()
+        val = (m.group(2) or "").strip() or "нет данных"
+        if key == "IDEA":
+            out["idea"] = val
+        elif key == "SOUND":
+            out["sound"] = val
+        elif key == "THEMES":
+            out["themes"] = val
+        elif key == "FEATURE":
+            out["feature"] = val
+    return out
 
 def sanitize_ai_text(text: str) -> str:
     if not text:
@@ -2664,6 +2691,32 @@ async def ai_artist_or_album(call: CallbackQuery):
                 'track_count': facts.get('track_count'),
             }
             text = await openai_generate_note(kind, slim_facts, wiki, lastfm)
+        
+            brief = parse_ai_brief(text or "")
+            track_count = (slim_facts or {}).get("track_count") if isinstance(slim_facts, dict) else None
+
+            if kind == "album":
+                body = (
+                    f"<b>💿 Об альбоме</b>\n"
+                    f"{html.escape(info['artist'])} — {html.escape(info['album'])}\n\n"
+                    f"Коротко:\n"
+                    f"• 🎭 <b>Идея</b> {html.escape(brief['idea'])}\n"
+                    f"• 🎧 <b>Звук</b> {html.escape(brief['sound'])}\n"
+                    f"• ✍️ <b>Темы</b> {html.escape(brief['themes'])}\n"
+                    f"• 🧠 <b>Фишка</b> {html.escape(brief['feature'])}\n"
+                )
+                if isinstance(track_count, int) and track_count > 0:
+                    body += f"\nТреков {track_count}"
+            else:
+                body = (
+                    f"<b>👤 Об артисте</b>\n"
+                    f"{html.escape(info['artist'])}\n\n"
+                    f"Коротко:\n"
+                    f"• 🎭 <b>Кто это</b> {html.escape(brief['idea'])}\n"
+                    f"• 🎧 <b>Звук</b> {html.escape(brief['sound'])}\n"
+                    f"• ✍️ <b>Темы</b> {html.escape(brief['themes'])}\n"
+                    f"• 🧠 <b>Фишка</b> {html.escape(brief['feature'])}\n"
+                )
         except Exception as e:
             log.exception("openai_generate_note failed: %s", e)
             try:
