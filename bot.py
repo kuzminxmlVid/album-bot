@@ -2328,6 +2328,15 @@ async def cmd_version(msg: Message):
     await msg.answer(f"Версия бота: {BOT_VERSION}")
 
 
+@router.callback_query()
+async def cb_unknown(call: CallbackQuery):
+    # Helps debug stale keyboards / missing handlers
+    try:
+        await call.answer("Кнопка устарела или команда не поддерживается в этой версии.", show_alert=True)
+    except Exception:
+        pass
+
+
 async def main():
     log.info("Bot version: %s", BOT_VERSION)
     global daily_task
