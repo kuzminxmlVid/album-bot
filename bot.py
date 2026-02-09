@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v51-2026-02-09_180514-e9bfee9a")
+BOT_VERSION = os.getenv("BOT_VERSION", "v53-2026-02-09_183324-533a98ce")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -2644,55 +2644,21 @@ async def ai_artist_or_album(call: CallbackQuery):
             disable_web_page_preview=True,
         )
 
-@router.callback_query()
-async def cb_legacy_or_unknown(call: CallbackQuery):
-    """
-    Backward compatibility for keyboards sent by older versions.
-    If callback is truly unknown, show debug-friendly alert.
-    """
+# Legacy callback data from older builds (compat)
+LEGACY_NEXT = {"next", "forward", "skip", "nav_next", "nav:next_album", "album:next"}
+LEGACY_PREV = {"prev", "back", "nav_prev", "nav:prev_album", "album:prev"}
+LEGACY_ALL = LEGACY_NEXT | LEGACY_PREV
+
+@router.callback_query(lambda c: (c.data or "").strip() in LEGACY_ALL)
+async def cb_legacy_nav(call: CallbackQuery):
     data = (call.data or "").strip()
-
-    # Legacy navigation buttons from older builds
-    legacy_next = {"next", "forward", "skip", "nav_next", "nav:next_album", "album:next"}
-    legacy_prev = {"prev", "back", "nav_prev", "nav:prev_album", "album:prev"}
-
-    if data in legacy_next:
-        # Reuse current navigation handler by rewriting data
+    if data in LEGACY_NEXT:
         call.data = "nav:next"
         return await nav_cb(call)
-
-    if data in legacy_prev:
+    if data in LEGACY_PREV:
         call.data = "nav:prev"
         return await nav_cb(call)
 
-    # Legacy AI modes from older builds (map to album info)
-    if data.startswith("ai:short:") or data.startswith("ai:long:") or data.startswith("ai:menu:"):
-        # Try to map to current "about album" handler when possible
-        parts = data.split(":")
-        # ai:short:<list>:<rank>  | ai:menu:<list>:<rank>
-        if len(parts) >= 4:
-            album_list = parts[-2]
-            rank = parts[-1]
-            call.data = f"ai:album:{album_list}:{rank}"
-            return await ai_artist_or_album(call)
-
-    # Legacy disabled features
-    if data in {"ui:daily", "ui:album_of_day", "albumday"}:
-        try:
-            await call.answer("Функция «Альбом дня» отключена.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    # Unknown callback: show alert with data + version
-    try:
-        await call.answer(
-            f"Кнопка устарела или команда не поддерживается.\n\nДанные: {data}\nВерсия: {BOT_VERSION}",
-            show_alert=True,
-        )
-    except Exception:
-        pass
-    return
 @router.callback_query(lambda c: c.data and c.data.startswith("fav:toggle:"))
 async def fav_toggle(call: CallbackQuery):
     try:
@@ -2721,6 +2687,17 @@ async def fav_toggle(call: CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=kb)
     except Exception as e:
         log.debug("fav toggle edit markup failed: %s", e)
+
+
+
+
+@router.callback_query()
+async def cb_unknown_callback(call: CallbackQuery):
+    data = (call.data or "").strip()
+    await call.answer(
+        f"Кнопка устарела или не поддерживается.\n\nДанные: {data}\nВерсия: {BOT_VERSION}",
+        show_alert=True,
+    )
 
 
 async def main():
