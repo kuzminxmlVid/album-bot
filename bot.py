@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v42-2026-02-09_132407-1c604690")
+BOT_VERSION = os.getenv("BOT_VERSION", "v45-2026-02-09_135003-ae34e7c1")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -2273,9 +2273,9 @@ async def ai_generate(call: CallbackQuery):
         await call.message.answer("Не нашёл этот альбом в списке.")
         return
 
-    cached = await get_cached_ai_note(album_list, rank, mode)
+    cached = await get_cached_ai_note(album_list, rank, kind)
     if cached:
-        title = {"short": "🧠 Коротко", "long": "📚 Подробно"}.get(mode, "🧠 AI")
+        title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
         await call.message.answer(
             f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(cached)}",
             parse_mode="HTML",
@@ -2290,9 +2290,9 @@ async def ai_generate(call: CallbackQuery):
 
     lock = _get_user_lock(call.from_user.id)
     async with lock:
-        cached2 = await get_cached_ai_note(album_list, rank, mode)
+        cached2 = await get_cached_ai_note(album_list, rank, kind)
         if cached2:
-            title = {"short": "🧠 Коротко", "long": "📚 Подробно"}.get(mode, "🧠 AI")
+            title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
             await call.message.answer(
                 f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(cached2)}",
                 parse_mode="HTML",
@@ -2306,18 +2306,37 @@ async def ai_generate(call: CallbackQuery):
         facts = await get_cached_album_facts(album_list, rank)
         if not facts:
             facts = await fetch_musicbrainz_facts(info["artist"], info["album"])
+        # safety: fetchers can fail and return None
+        if not isinstance(facts, dict):
+            facts = {
+                "artist": info.get("artist"),
+                "album": info.get("album"),
+                "source": "none",
+            }
+        try:
             facts["songlink_url"] = await get_songlink_url(album_list, rank, info["artist"], info["album"])
             facts["google_url"] = google_link(info["artist"], info["album"])
             await set_cached_album_facts(album_list, rank, facts)
-        text = await openai_generate_album_note(mode, facts)
+        except Exception as e:
+            log.debug("songlink/google facts fill failed: %s", e)
+        try:
+            text = await openai_generate_album_note(kind, facts)
 
-        if not text:
-            await thinking.edit_text("Не получилось получить ответ AI. Попробуй позже.")
+            if not text:
+                await thinking.edit_text("Не получилось получить ответ AI. Попробуй позже.")
+                return
+
+            await set_cached_ai_note(album_list, rank, kind, text)
+
+            title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
+        except Exception as e:
+            log.exception("AI generation failed: %s", e)
+            try:
+                await thinking.edit_text("AI упал на этом запросе. Попробуй ещё раз.")
+            except Exception:
+                pass
             return
 
-        await set_cached_ai_note(album_list, rank, mode, text)
-
-        title = {"short": "🧠 Коротко", "long": "📚 Подробно"}.get(mode, "🧠 AI")
         await thinking.edit_text(
             f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(text)}",
             parse_mode="HTML",
@@ -2385,17 +2404,39 @@ async def ai_artist_or_album(call: CallbackQuery):
         facts = await get_cached_album_facts(album_list, rank)
         if not facts:
             facts = await fetch_musicbrainz_facts(info["artist"], info["album"])
+        # safety: fetchers can fail and return None
+        if not isinstance(facts, dict):
+            facts = {
+                "artist": info.get("artist"),
+                "album": info.get("album"),
+                "source": "none",
+            }
+        try:
             facts["songlink_url"] = await get_songlink_url(album_list, rank, info["artist"], info["album"])
             facts["google_url"] = google_link(info["artist"], info["album"])
             await set_cached_album_facts(album_list, rank, facts)
+        except Exception as e:
+            log.debug("songlink/google facts fill failed: %s", e)
 
         # wikipedia summary
-        if kind == "artist":
-            wiki = await fetch_wikipedia_summary(info["artist"])
-        else:
-            wiki = await fetch_wikipedia_summary(f"{info['artist']} {info['album']} album")
+        try:
+            if kind == "artist":
+                wiki = await fetch_wikipedia_summary(info["artist"])
+            else:
+                wiki = await fetch_wikipedia_summary(f"{info['artist']} {info['album']} album")
+        except Exception as e:
+            log.debug("wikipedia fetch failed: %s", e)
+            wiki = {}
 
-        text = await openai_generate_note(kind, facts, wiki)
+        try:
+            text = await openai_generate_note(kind, facts, wiki)
+        except Exception as e:
+            log.exception("openai_generate_note failed: %s", e)
+            try:
+                await thinking.edit_text("AI завис или упал. Попробуй ещё раз.")
+            except Exception:
+                pass
+            return
         if not text:
             await thinking.edit_text("Не получилось получить ответ AI. Попробуй позже.")
             return
