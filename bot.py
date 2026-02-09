@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v48-2026-02-09_171603-12518467")
+BOT_VERSION = os.getenv("BOT_VERSION", "v49-2026-02-09_174027-1c6276ea")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -65,7 +65,8 @@ if Config.DATABASE_URL.startswith("postgres://"):
 # ================= AI (OpenAI) =================
 
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "").strip()
 
 AI_MAX_DAILY_DEFAULT = 30
 AI_CACHE_DAYS_DEFAULT = 30
