@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v50-2026-02-09_175754-8700ad0a")
+BOT_VERSION = os.getenv("BOT_VERSION", "v51-2026-02-09_180514-e9bfee9a")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -648,6 +648,8 @@ def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
     )
 
 async def openai_generate_note(kind: str, facts: dict, wiki: dict, lastfm: dict) -> Optional[str]:
+    wiki = wiki or {}
+    lastfm = lastfm or {}
     if not OPENAI_API_KEY:
         return None
     kind = (kind or "").strip().lower()
@@ -2605,8 +2607,10 @@ async def ai_artist_or_album(call: CallbackQuery):
         try:
             if kind == "artist":
                 wiki = await fetch_wikipedia_summary(info["artist"])
+                wiki = wiki or {}
             else:
                 wiki = await fetch_wikipedia_summary(f"{info['artist']} {info['album']} album")
+                wiki = wiki or {}
         except Exception as e:
             log.debug("wikipedia fetch failed: %s", e)
             wiki = {}
