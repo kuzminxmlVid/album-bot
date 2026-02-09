@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v49-2026-02-09_174027-1c6276ea")
+BOT_VERSION = os.getenv("BOT_VERSION", "v50-2026-02-09_175754-8700ad0a")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -614,7 +614,7 @@ def _ai_system_prompt_note() -> str:
         "Пиши по-русски, структурно, без воды."
     )
 
-def _ai_user_prompt_artist(facts: dict, wiki: dict) -> str:
+def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
     return (
         "Сделай биографическую справку об исполнителе. "
         "Формат:\n"
@@ -630,7 +630,7 @@ def _ai_user_prompt_artist(facts: dict, wiki: dict) -> str:
         f"url: {wiki.get('url')}\n"
     )
 
-def _ai_user_prompt_album(facts: dict, wiki: dict) -> str:
+def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
     return (
         "Сделай справку об альбоме. "
         "Формат:\n"
