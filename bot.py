@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v47-2026-02-09_165034-9c06ecf4")
+BOT_VERSION = os.getenv("BOT_VERSION", "v48-2026-02-09_171603-12518467")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
