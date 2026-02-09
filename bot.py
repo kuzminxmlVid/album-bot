@@ -4,6 +4,7 @@ import csv
 import io
 import asyncio
 import logging
+import html
 
 BOT_VERSION = "v31-2026-02-08_185954-06182358"
 from typing import Optional, Dict, List
