@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v45-2026-02-09_135003-ae34e7c1")
+BOT_VERSION = os.getenv("BOT_VERSION", "v47-2026-02-09_165034-9c06ecf4")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -67,8 +67,15 @@ if Config.DATABASE_URL.startswith("postgres://"):
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-AI_MAX_DAILY_DEFAULT = 15
+AI_MAX_DAILY_DEFAULT = 30
 AI_CACHE_DAYS_DEFAULT = 30
+
+def strip_html(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return s.strip()
 
 def _ai_max_daily() -> int:
     try:
@@ -211,9 +218,32 @@ async def init_pg() -> None:
         except Exception:
             pass
         await conn.execute("""
+        CREATE TABLE IF NOT EXISTS relisten (
+            user_id BIGINT NOT NULL,
+            album_list TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, album_list, rank)
+        )
+        """)
+        await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_relisten_user
         ON relisten (user_id, added_at DESC)
         """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id BIGINT NOT NULL,
+            album_list TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, album_list, rank)
+        )
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_favorites_user
+        ON favorites (user_id, added_at DESC)
+        """)
+
 
         # daily subscription
         await conn.execute("""
@@ -492,6 +522,77 @@ async def fetch_wikipedia_summary(query: str) -> dict:
     except Exception:
         return out
 
+async def fetch_lastfm_artist_info(artist: str) -> dict:
+    if not LASTFM_API_KEY:
+        return {}
+    a = (artist or "").strip()
+    if not a:
+        return {}
+    try:
+        async with _http().get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                "method": "artist.getinfo",
+                "artist": a,
+                "api_key": LASTFM_API_KEY,
+                "format": "json",
+                "autocorrect": 1,
+            },
+            timeout=20,
+        ) as r:
+            data = await r.json(content_type=None)
+            art = (data or {}).get("artist") or {}
+            bio = (art.get("bio") or {})
+            tags = art.get("tags", {}).get("tag") or []
+            tag_names = []
+            if isinstance(tags, list):
+                tag_names = [t.get("name") for t in tags if isinstance(t, dict) and t.get("name")][:10]
+            return {
+                "name": art.get("name") or a,
+                "bio": strip_html(bio.get("summary") or bio.get("content") or ""),
+                "tags": tag_names,
+            }
+    except Exception as e:
+        log.debug("lastfm artist fetch failed: %s", e)
+        return {}
+
+async def fetch_lastfm_album_info(artist: str, album: str) -> dict:
+    if not LASTFM_API_KEY:
+        return {}
+    a = (artist or "").strip()
+    b = (album or "").strip()
+    if not a or not b:
+        return {}
+    try:
+        async with _http().get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                "method": "album.getinfo",
+                "artist": a,
+                "album": b,
+                "api_key": LASTFM_API_KEY,
+                "format": "json",
+                "autocorrect": 1,
+            },
+            timeout=20,
+        ) as r:
+            data = await r.json(content_type=None)
+            alb = (data or {}).get("album") or {}
+            wiki = alb.get("wiki") or {}
+            tags = alb.get("tags", {}).get("tag") or []
+            tag_names = []
+            if isinstance(tags, list):
+                tag_names = [t.get("name") for t in tags if isinstance(t, dict) and t.get("name")][:10]
+            return {
+                "name": alb.get("name") or b,
+                "artist": (alb.get("artist") or a),
+                "summary": strip_html(wiki.get("summary") or wiki.get("content") or ""),
+                "tags": tag_names,
+            }
+    except Exception as e:
+        log.debug("lastfm album fetch failed: %s", e)
+        return {}
+
     try:
         rest = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{quote(out['title'])}"
         async with _http().get(rest, headers=headers, timeout=20) as r:
@@ -545,14 +646,14 @@ def _ai_user_prompt_album(facts: dict, wiki: dict) -> str:
         f"url: {wiki.get('url')}\n"
     )
 
-async def openai_generate_note(kind: str, facts: dict, wiki: dict) -> Optional[str]:
+async def openai_generate_note(kind: str, facts: dict, wiki: dict, lastfm: dict) -> Optional[str]:
     if not OPENAI_API_KEY:
         return None
     kind = (kind or "").strip().lower()
     if kind not in AI_MODE_LIMITS:
         return None
 
-    user_prompt = _ai_user_prompt_artist(facts, wiki) if kind == "artist" else _ai_user_prompt_album(facts, wiki)
+    user_prompt = _ai_user_prompt_artist(facts, wiki, lastfm) if kind == "artist" else _ai_user_prompt_album(facts, wiki, lastfm)
     payload = {
         "model": AI_MODEL,
         "input": [
@@ -1046,6 +1147,59 @@ async def is_relisten(user_id: int, album_list: str, rank: int) -> bool:
         )
         return row is not None
 
+async def is_favorite(user_id: int, album_list: str, rank: int) -> bool:
+    if not pg_pool:
+        return False
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM favorites WHERE user_id=$1 AND album_list=$2 AND rank=$3",
+            user_id, album_list, rank
+        )
+        return row is not None
+
+async def toggle_favorite(user_id: int, album_list: str, rank: int) -> bool:
+    """Returns new state: True if now favorited."""
+    if not pg_pool:
+        return False
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM favorites WHERE user_id=$1 AND album_list=$2 AND rank=$3",
+            user_id, album_list, rank
+        )
+        if row:
+            await conn.execute(
+                "DELETE FROM favorites WHERE user_id=$1 AND album_list=$2 AND rank=$3",
+                user_id, album_list, rank
+            )
+            return False
+        await conn.execute(
+            "INSERT INTO favorites (user_id, album_list, rank, added_at) VALUES ($1,$2,$3,NOW()) ON CONFLICT DO NOTHING",
+            user_id, album_list, rank
+        )
+        return True
+
+async def list_favorites(user_id: int, limit: int = 50) -> list[tuple[str,int]]:
+    if not pg_pool:
+        return []
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT album_list, rank FROM favorites WHERE user_id=$1 ORDER BY added_at DESC LIMIT $2",
+            user_id, limit
+        )
+        return [(r["album_list"], int(r["rank"])) for r in rows]
+
+async def random_favorite(user_id: int) -> Optional[tuple[str,int]]:
+    if not pg_pool:
+        return None
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT album_list, rank FROM favorites WHERE user_id=$1 ORDER BY random() LIMIT 1",
+            user_id
+        )
+        if not row:
+            return None
+        return (row["album_list"], int(row["rank"]))
+
 async def toggle_relisten(user_id: int, album_list: str, rank: int) -> bool:
     """Toggle relisten state. Returns True if now enabled."""
     async with _pool().acquire() as conn:
@@ -1136,15 +1290,16 @@ def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: O
         f"{relisten_line}"
     )
 
-def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, listen_url: Optional[str], *, in_relisten: bool = False) -> InlineKeyboardMarkup:
+def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, listen_url: Optional[str], *, in_relisten: bool = False, is_fav: bool = False) -> InlineKeyboardMarkup:
     rate_text = "⭐ Оценить" if not rated else f"⭐ Оценено: {rated}"
     rel_text = "🔁 Переслушаю ✅" if in_relisten else "🔁 Переслушаю"
+    fav_text = "❤️ Любимое ✅" if is_fav else "❤️ Любимое"
     enc = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
-            [InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), InlineKeyboardButton(text="💿 Об альбоме", callback_data=f"ai:album:{album_list}:{rank}")],
+            [InlineKeyboardButton(text=fav_text, callback_data=f"fav:toggle:{album_list}:{rank}"), InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), InlineKeyboardButton(text="💿 Об альбоме", callback_data=f"ai:album:{album_list}:{rank}")],
         [
-            InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
+            InlineKeyboardButton(text="Предыдущий", callback_data="nav:prev"),
             InlineKeyboardButton(text="Следующий", callback_data="nav:next"),
         ],
         [
@@ -1215,7 +1370,8 @@ async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix
     in_rel = await is_relisten(user_id, album_list, rank)
     caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
-    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel)
+    is_fav = await is_favorite(user_id, album_list, rank)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
     return cover, caption, kb, rank, user_rating, artist, album, genre
 
 async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "flow", prefix: str = "") -> None:
@@ -2343,6 +2499,32 @@ async def ai_generate(call: CallbackQuery):
         )
 
 
+@router.message(Command("favorites"))
+async def cmd_favorites(message: Message):
+    items = await list_favorites(message.from_user.id, limit=50)
+    if not items:
+        await message.answer("Любимых альбомов пока нет.")
+        return
+    lines = ["❤️ Любимые (последние 50):"]
+    for (lst, rk) in items:
+        info = await _album_by_rank(lst, rk)
+        if info:
+            lines.append(f"{lst} #{rk}: {info['artist']} — {info['album']}")
+        else:
+            lines.append(f"{lst} #{rk}")
+    await message.answer("\n".join(lines))
+
+@router.message(Command("rand_favorite"))
+async def cmd_rand_favorite(message: Message):
+    item = await random_favorite(message.from_user.id)
+    if not item:
+        await message.answer("Любимых альбомов пока нет.")
+        return
+    lst, rk = item
+    await set_selected_list(message.from_user.id, lst)
+    await set_progress(message.from_user.id, lst, rk)
+    await send_album_post(message.from_user.id, lst)
+
 @router.message(Command("version"))
 async def cmd_version(msg: Message):
     await msg.answer(f"Версия бота: {BOT_VERSION}")
@@ -2429,7 +2611,14 @@ async def ai_artist_or_album(call: CallbackQuery):
             wiki = {}
 
         try:
-            text = await openai_generate_note(kind, facts, wiki)
+            lastfm = await fetch_lastfm_artist_info(info['artist']) if kind == 'artist' else await fetch_lastfm_album_info(info['artist'], info['album'])
+            slim_facts = {
+                'artist': facts.get('artist'),
+                'album': facts.get('album'),
+                'tags': facts.get('tags') or [],
+                'track_count': facts.get('track_count'),
+            }
+            text = await openai_generate_note(kind, slim_facts, wiki, lastfm)
         except Exception as e:
             log.exception("openai_generate_note failed: %s", e)
             try:
@@ -2499,6 +2688,35 @@ async def cb_legacy_or_unknown(call: CallbackQuery):
     except Exception:
         pass
     return
+@router.callback_query(lambda c: c.data and c.data.startswith("fav:toggle:"))
+async def fav_toggle(call: CallbackQuery):
+    try:
+        _, _, album_list, rank_s = call.data.split(":", 3)
+        rank = int(rank_s)
+    except Exception:
+        await call.answer("Ошибка.", show_alert=True)
+        return
+
+    new_state = await toggle_favorite(call.from_user.id, album_list, rank)
+    await call.answer("Добавлено в любимое" if new_state else "Убрано из любимого")
+
+    # Update keyboard badge in-place
+    try:
+        info = await _album_by_rank(album_list, rank)
+        if not info:
+            return
+        rated = await get_rating(call.from_user.id, album_list, rank)
+        in_relisten = await is_in_relisten(call.from_user.id, album_list, rank)
+        listen_url = await get_songlink_url(album_list, rank, info["artist"], info["album"])
+        kb = album_keyboard(
+            album_list, rank, info["artist"], info["album"],
+            rated, ctx="post", listen_url=listen_url,
+            in_relisten=in_relisten, is_fav=new_state
+        )
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception as e:
+        log.debug("fav toggle edit markup failed: %s", e)
+
 
 async def main():
     log.info("Bot version: %s", BOT_VERSION)
