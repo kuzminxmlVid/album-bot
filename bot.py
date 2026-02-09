@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = "v39-2026-02-08_185954-06182358"
+BOT_VERSION = "v31-2026-02-08_185954-06182358"
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -2329,14 +2329,56 @@ async def cmd_version(msg: Message):
     await msg.answer(f"Версия бота: {BOT_VERSION}")
 
 
+
 @router.callback_query()
-async def cb_unknown(call: CallbackQuery):
-    # Helps debug stale keyboards / missing handlers
+async def cb_legacy_or_unknown(call: CallbackQuery):
+    """
+    Backward compatibility for keyboards sent by older versions.
+    If callback is truly unknown, show debug-friendly alert.
+    """
+    data = (call.data or "").strip()
+
+    # Legacy navigation buttons from older builds
+    legacy_next = {"next", "forward", "skip", "nav_next", "nav:next_album", "album:next"}
+    legacy_prev = {"prev", "back", "nav_prev", "nav:prev_album", "album:prev"}
+
+    if data in legacy_next:
+        # Reuse current navigation handler by rewriting data
+        call.data = "nav:next"
+        return await nav_cb(call)
+
+    if data in legacy_prev:
+        call.data = "nav:prev"
+        return await nav_cb(call)
+
+    # Legacy AI modes from older builds (map to album info)
+    if data.startswith("ai:short:") or data.startswith("ai:long:") or data.startswith("ai:menu:"):
+        # Try to map to current "about album" handler when possible
+        parts = data.split(":")
+        # ai:short:<list>:<rank>  | ai:menu:<list>:<rank>
+        if len(parts) >= 4:
+            album_list = parts[-2]
+            rank = parts[-1]
+            call.data = f"ai:album:{album_list}:{rank}"
+            return await ai_artist_or_album(call)
+
+    # Legacy disabled features
+    if data in {"ui:daily", "ui:album_of_day", "albumday"}:
+        try:
+            await call.answer("Функция «Альбом дня» отключена.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Unknown callback: show alert with data + version
     try:
-        await call.answer("Кнопка устарела или команда не поддерживается в этой версии.", show_alert=True)
+        await call.answer(
+            f"Кнопка устарела или команда не поддерживается.\n\nДанные: {data}\nВерсия: {BOT_VERSION}",
+            show_alert=True,
+        )
     except Exception:
         pass
-
+    return
 
 async def main():
     log.info("Bot version: %s", BOT_VERSION)
