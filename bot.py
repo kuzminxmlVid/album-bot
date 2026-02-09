@@ -175,25 +175,25 @@ async def init_pg() -> None:
         """)
 
 
-await conn.execute("""
-CREATE TABLE IF NOT EXISTS ai_notes (
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_notes (
     album_list TEXT NOT NULL,
     rank INTEGER NOT NULL,
     mode TEXT NOT NULL,
     text TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (album_list, rank, mode)
-)
-""")
+        )
+        """)
 
-await conn.execute("""
-CREATE TABLE IF NOT EXISTS ai_usage (
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_usage (
     user_id BIGINT NOT NULL,
     day DATE NOT NULL,
     cnt INTEGER NOT NULL,
     PRIMARY KEY (user_id, day)
-)
-""")
+        )
+        """)
         # Ensure defaults for caches
         try:
             await conn.execute("ALTER TABLE songlinks ALTER COLUMN updated_at SET DEFAULT NOW()")
@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS ai_usage (
         ON relisten (user_id, added_at DESC)
         """)
 
-# daily subscription
+        # daily subscription
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_subscriptions (
             user_id BIGINT PRIMARY KEY,
