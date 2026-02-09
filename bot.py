@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v41-2026-02-09_120927-e8636178")
+BOT_VERSION = os.getenv("BOT_VERSION", "v42-2026-02-09_132407-1c604690")
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -2243,7 +2243,7 @@ async def _album_by_rank(album_list: str, rank: int) -> Optional[dict]:
     row = df.iloc[int(idx)]
     return {"artist": str(row["artist"]), "album": str(row["album"])}
 
-@router.callback_query(lambda c: c.data and c.data.startswith("ai:menu:"))
+@router.callback_query(lambda c: False)
 async def ai_menu(call: CallbackQuery):
     try:
         _, _, album_list, rank_s = call.data.split(":", 3)
@@ -2254,7 +2254,7 @@ async def ai_menu(call: CallbackQuery):
     await call.answer()
     await call.message.answer("Выбери режим AI:", reply_markup=ai_menu_keyboard(album_list, rank))
 
-@router.callback_query(lambda c: c.data and (c.data.startswith("ai:short:") or c.data.startswith("ai:long:")))
+@router.callback_query(lambda c: False)
 async def ai_generate(call: CallbackQuery):
     await call.answer()
     try:
@@ -2329,6 +2329,85 @@ async def cmd_version(msg: Message):
     await msg.answer(f"Версия бота: {BOT_VERSION}")
 
 
+
+
+@router.callback_query(lambda c: c.data and (c.data.startswith("ai:artist:") or c.data.startswith("ai:album:")))
+async def ai_artist_or_album(call: CallbackQuery):
+    await call.answer()
+    try:
+        _, kind, album_list, rank_s = call.data.split(":", 3)
+        rank = int(rank_s)
+    except Exception:
+        await call.message.answer("Не понял запрос.")
+        return
+
+    if not OPENAI_API_KEY:
+        await call.message.answer("AI не настроен. Добавь переменную OPENAI_API_KEY в Railway.")
+        return
+
+    info = await _album_by_rank(album_list, rank)
+    if not info:
+        await call.message.answer("Не нашёл этот альбом в списке.")
+        return
+
+    cached = await get_cached_ai_note(album_list, rank, kind)
+    if cached:
+        title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
+        await call.message.answer(
+            f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(cached)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    used = await get_ai_usage_today(call.from_user.id)
+    limit = _ai_max_daily()
+    if used >= limit:
+        await call.message.answer(f"Лимит AI на сегодня: {limit}. Попробуй завтра.")
+        return
+
+    lock = _get_user_lock(call.from_user.id)
+    async with lock:
+        cached2 = await get_cached_ai_note(album_list, rank, kind)
+        if cached2:
+            title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
+            await call.message.answer(
+                f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(cached2)}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        await inc_ai_usage_today(call.from_user.id)
+        thinking = await call.message.answer("⏳ Думаю...")
+
+        # facts from MusicBrainz (cached)
+        facts = await get_cached_album_facts(album_list, rank)
+        if not facts:
+            facts = await fetch_musicbrainz_facts(info["artist"], info["album"])
+            facts["songlink_url"] = await get_songlink_url(album_list, rank, info["artist"], info["album"])
+            facts["google_url"] = google_link(info["artist"], info["album"])
+            await set_cached_album_facts(album_list, rank, facts)
+
+        # wikipedia summary
+        if kind == "artist":
+            wiki = await fetch_wikipedia_summary(info["artist"])
+        else:
+            wiki = await fetch_wikipedia_summary(f"{info['artist']} {info['album']} album")
+
+        text = await openai_generate_note(kind, facts, wiki)
+        if not text:
+            await thinking.edit_text("Не получилось получить ответ AI. Попробуй позже.")
+            return
+
+        await set_cached_ai_note(album_list, rank, kind, text)
+
+        title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
+        await thinking.edit_text(
+            f"{title}\n<b>{html.escape(info['artist'])} — {html.escape(info['album'])}</b>\n\n{html.escape(text)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 @router.callback_query()
 async def cb_legacy_or_unknown(call: CallbackQuery):
