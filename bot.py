@@ -405,6 +405,103 @@ def _http() -> aiohttp.ClientSession:
 def _mb_headers() -> Dict[str, str]:
     return {"User-Agent": f"{Config.MB_APP} ({Config.MB_CONTACT})"}
 
+def _ms_to_mmss(ms: Optional[int]) -> Optional[str]:
+    if not ms:
+        return None
+    try:
+        s = int(ms) // 1000
+        m = s // 60
+        s = s % 60
+        return f"{m}:{s:02d}"
+    except Exception:
+        return None
+
+async def fetch_musicbrainz_facts(artist: str, album: str) -> dict:
+    """Best-effort facts from MusicBrainz, without guessing."""
+    facts: dict = {
+        "artist": artist,
+        "album": album,
+        "source": "musicbrainz",
+        "release_group_id": None,
+        "first_release_date": None,
+        "primary_type": None,
+        "secondary_types": [],
+        "tags": [],
+        "label": None,
+        "track_count": None,
+        "tracks": [],
+    }
+
+    q = f'artist:"{artist}" AND releasegroup:"{album}"'
+    try:
+        async with _http().get(
+            "https://musicbrainz.org/ws/2/release-group/",
+            params={"query": q, "fmt": "json", "limit": 1, "inc": "tags"},
+            headers=_mb_headers(),
+            timeout=30,
+        ) as r:
+            data = await r.json(content_type=None)
+            rgs = data.get("release-groups") or []
+            if not rgs:
+                return facts
+            rg = rgs[0]
+            facts["release_group_id"] = rg.get("id")
+            facts["first_release_date"] = rg.get("first-release-date")
+            facts["primary_type"] = rg.get("primary-type")
+            facts["secondary_types"] = rg.get("secondary-types") or []
+            tags = rg.get("tags") or []
+            facts["tags"] = [t.get("name") for t in tags if isinstance(t, dict) and t.get("name")][:10]
+    except Exception as e:
+        log.debug("musicbrainz release-group facts failed: %s", e)
+        return facts
+
+    rg_id = facts.get("release_group_id")
+    if not rg_id:
+        return facts
+
+    try:
+        async with _http().get(
+            "https://musicbrainz.org/ws/2/release/",
+            params={"release-group": rg_id, "fmt": "json", "limit": 1, "inc": "recordings+labels"},
+            headers=_mb_headers(),
+            timeout=30,
+        ) as r:
+            data = await r.json(content_type=None)
+            rels = data.get("releases") or []
+            if not rels:
+                return facts
+            rel = rels[0]
+
+            li = rel.get("label-info") or []
+            if li and isinstance(li, list):
+                lab = li[0].get("label") if isinstance(li[0], dict) else None
+                if isinstance(lab, dict):
+                    facts["label"] = lab.get("name")
+
+            media = rel.get("media") or []
+            tracks_out = []
+            total_tracks = 0
+            if media and isinstance(media, list):
+                for m_ in media:
+                    tr = m_.get("tracks") if isinstance(m_, dict) else None
+                    if isinstance(tr, list):
+                        for t in tr:
+                            if not isinstance(t, dict):
+                                continue
+                            total_tracks += 1
+                            if len(tracks_out) < 10:
+                                tracks_out.append({
+                                    "title": t.get("title"),
+                                    "length": _ms_to_mmss(t.get("length")),
+                                })
+            facts["track_count"] = total_tracks if total_tracks else None
+            facts["tracks"] = tracks_out
+    except Exception as e:
+        log.debug("musicbrainz release facts failed: %s", e)
+
+    return facts
+
+
 async def fetch_image_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
     try:
         async with _http().get(url, allow_redirects=True) as r:
