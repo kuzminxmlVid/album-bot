@@ -83,8 +83,8 @@ def _ai_cache_days() -> int:
         return AI_CACHE_DAYS_DEFAULT
 
 AI_MODE_LIMITS = {
-    "short": 220,
-    "long": 650,
+    "artist": 650,
+    "album": 900,
 }
 
 
@@ -454,6 +454,126 @@ async def fetch_musicbrainz_facts(artist: str, album: str) -> dict:
     except Exception as e:
         log.debug("musicbrainz release-group facts failed: %s", e)
         return facts
+
+
+async def fetch_wikipedia_summary(query: str) -> dict:
+    """
+    Returns {"title": str|None, "extract": str|None, "url": str|None}
+    Best-effort: search -> page summary (ru, fallback en).
+    """
+    out = {"title": None, "extract": None, "url": None}
+    q = (query or "").strip()
+    if not q:
+        return out
+    headers = {"User-Agent": _mb_headers().get("User-Agent", "AlbumBot/1.0")}
+    lang = "ru"
+
+    async def _search(_lang: str) -> str | None:
+        async with _http().get(
+            f"https://{_lang}.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": q, "format": "json", "srlimit": 1},
+            headers=headers,
+            timeout=20,
+        ) as r:
+            data = await r.json(content_type=None)
+            items = (((data or {}).get("query") or {}).get("search") or [])
+            if not items:
+                return None
+            return items[0].get("title")
+
+    try:
+        title = await _search("ru")
+        if not title:
+            title = await _search("en")
+            lang = "en"
+        if not title:
+            return out
+        out["title"] = title
+    except Exception:
+        return out
+
+    try:
+        rest = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{quote(out['title'])}"
+        async with _http().get(rest, headers=headers, timeout=20) as r:
+            data = await r.json(content_type=None)
+            out["extract"] = (data or {}).get("extract")
+            out["url"] = ((data or {}).get("content_urls") or {}).get("desktop", {}).get("page")
+    except Exception:
+        pass
+
+    return out
+
+def _ai_system_prompt_note() -> str:
+    return (
+        "Ты помощник в телеграм-боте. "
+        "Используй ТОЛЬКО факты из входных данных (MusicBrainz JSON и Wikipedia summary). "
+        "Запрещено добавлять домыслы, несуществующие факты, гостей, даты и т.п. "
+        "Если данных нет — пиши 'нет данных'. "
+        "Пиши по-русски, структурно, без воды."
+    )
+
+def _ai_user_prompt_artist(facts: dict, wiki: dict) -> str:
+    return (
+        "Сделай биографическую справку об исполнителе. "
+        "Формат:\n"
+        "Кто это: (1–2 предложения)\n"
+        "Ключевые факты: (маркированно)\n"
+        "Жанры/теги: \n"
+        "Ссылки: (Wikipedia url если есть)\n\n"
+        "ВХОДНЫЕ ДАННЫЕ (MusicBrainz JSON):\n"
+        f"{json.dumps(facts, ensure_ascii=False)}\n\n"
+        "ВХОДНЫЕ ДАННЫЕ (Wikipedia summary):\n"
+        f"title: {wiki.get('title')}\n"
+        f"extract: {wiki.get('extract')}\n"
+        f"url: {wiki.get('url')}\n"
+    )
+
+def _ai_user_prompt_album(facts: dict, wiki: dict) -> str:
+    return (
+        "Сделай справку об альбоме. "
+        "Формат:\n"
+        "Что это за релиз: (1–2 предложения)\n"
+        "Факты: дата первого релиза, тип, лейбл, теги\n"
+        "Треклист: (если есть, до 10)\n"
+        "Гости/история создания: ТОЛЬКО если прямо сказано во входных данных, иначе 'нет данных'\n"
+        "Ссылки: (song.link/album.link если есть, Wikipedia url если есть)\n\n"
+        "ВХОДНЫЕ ДАННЫЕ (MusicBrainz JSON):\n"
+        f"{json.dumps(facts, ensure_ascii=False)}\n\n"
+        "ВХОДНЫЕ ДАННЫЕ (Wikipedia summary):\n"
+        f"title: {wiki.get('title')}\n"
+        f"extract: {wiki.get('extract')}\n"
+        f"url: {wiki.get('url')}\n"
+    )
+
+async def openai_generate_note(kind: str, facts: dict, wiki: dict) -> Optional[str]:
+    if not OPENAI_API_KEY:
+        return None
+    kind = (kind or "").strip().lower()
+    if kind not in AI_MODE_LIMITS:
+        return None
+
+    user_prompt = _ai_user_prompt_artist(facts, wiki) if kind == "artist" else _ai_user_prompt_album(facts, wiki)
+    payload = {
+        "model": AI_MODEL,
+        "input": [
+            {"role": "system", "content": _ai_system_prompt_note()},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_output_tokens": AI_MODE_LIMITS[kind],
+        "store": False,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    try:
+        async with _http().post("https://api.openai.com/v1/responses", json=payload, headers=headers, timeout=60) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                log.warning("openai error %s: %s", r.status, str(data)[:500])
+                return None
+            text = _extract_response_text(data)
+            return text.strip() if text else None
+    except Exception as e:
+        log.exception("openai request failed: %s", e)
+        return None
 
     rg_id = facts.get("release_group_id")
     if not rg_id:
@@ -1022,7 +1142,7 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
     enc = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
-            [InlineKeyboardButton(text="🧠 AI", callback_data=f"ai:menu:{album_list}:{rank}")],
+            [InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), InlineKeyboardButton(text="💿 Об альбоме", callback_data=f"ai:album:{album_list}:{rank}")],
         [
             InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
             InlineKeyboardButton(text="Пропустить", callback_data="nav:next"),
