@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = "v31-2026-02-08_185954-06182358"
+BOT_VERSION = "v39-2026-02-08_185954-06182358"
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -1145,7 +1145,7 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
             [InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), InlineKeyboardButton(text="💿 Об альбоме", callback_data=f"ai:album:{album_list}:{rank}")],
         [
             InlineKeyboardButton(text="Прыдыдущий альбом", callback_data="nav:prev"),
-            InlineKeyboardButton(text="Пропустить", callback_data="nav:next"),
+            InlineKeyboardButton(text="Следующий", callback_data="nav:next"),
         ],
         [
             InlineKeyboardButton(text=rate_text, callback_data=f"ui:rate:{enc}:{rank}:{ctx}"),
@@ -1166,12 +1166,10 @@ def rating_keyboard(album_list: str, rank: int, ctx: str) -> InlineKeyboardMarku
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
-        [InlineKeyboardButton(text="🔄 Сначала списка", callback_data="nav:reset")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
         [InlineKeyboardButton(text="📈 Статистика+", callback_data="ui:stats_plus")],
         [InlineKeyboardButton(text="🔁 На переслушать", callback_data="ui:relisten_menu")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
-        [InlineKeyboardButton(text="☀️ Альбом дня", callback_data="ui:daily")],
     ])
 def stats_plus_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1800,6 +1798,9 @@ async def cmd_go(msg: Message):
     if idx is None:
         await msg.answer(f"Не нашёл альбом #{rank} в списке {album_list}.")
         return
+
+    await set_selected_list(msg.from_user.id, album_list)
+    await set_index(msg.from_user.id, album_list, idx)
 
     await send_album_post(
         msg.from_user.id,
