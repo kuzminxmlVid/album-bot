@@ -7,7 +7,8 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v53-2026-02-09_183324-533a98ce")
+BOT_VERSION = os.getenv("BOT_VERSION", "v54-2026-02-09_184805-76f9d44d")
+AI_CACHE_VERSION = 3  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -607,11 +608,13 @@ async def fetch_lastfm_album_info(artist: str, album: str) -> dict:
 
 def _ai_system_prompt_note() -> str:
     return (
-        "Ты помощник в телеграм-боте. "
-        "Используй ТОЛЬКО факты из входных данных (MusicBrainz JSON и Wikipedia summary). "
-        "Запрещено добавлять домыслы, несуществующие факты, гостей, даты и т.п. "
-        "Если данных нет — пиши 'нет данных'. "
-        "Пиши по-русски, структурно, без воды."
+        "Ты пишешь короткую справку для телеграм-бота о музыке. "
+        "Используй ТОЛЬКО факты из входных данных. "
+        "Ничего не выдумывай и не додумывай. "
+        "Если во входных данных нет факта — пиши 'нет данных'. "
+        "Не используй Markdown (никаких ###, **, списков с '•' тоже не надо). "
+        "Пиши простыми строками. Без ссылок. Без дат релиза, лейблов и типов релиза. "
+        "Старайся уложиться в 8–12 коротких строк."
     )
 
 def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
@@ -646,6 +649,43 @@ def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
         f"extract: {wiki.get('extract')}\n"
         f"url: {wiki.get('url')}\n"
     )
+
+
+def sanitize_ai_text(text: str) -> str:
+    if not text:
+        return "нет данных"
+    t = text.strip()
+
+    # remove markdown artifacts
+    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.MULTILINE)
+    t = t.replace("**", "").replace("__", "").replace("`", "")
+
+    # remove disallowed sections if model still outputs them
+    disallowed_prefixes = (
+        "Дата первого релиза",
+        "Дата релиза",
+        "Тип:",
+        "Лейбл",
+        "Ссылки",
+        "Треклист",
+    )
+    lines = []
+    for line in t.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if any(s.startswith(p) for p in disallowed_prefixes):
+            continue
+        # also drop headings like "Факты:" if it only leads into removed content
+        if s in ("Факты:", "Факты", "Ссылки:", "Ссылки", "Треклист:", "Треклист"):
+            continue
+        lines.append(s)
+
+    # collapse to max ~14 lines
+    lines = lines[:14]
+    if not lines:
+        return "нет данных"
+    return "\n".join(lines)
 
 async def openai_generate_note(kind: str, facts: dict, wiki: dict, lastfm: dict) -> Optional[str]:
     wiki = wiki or {}
@@ -956,7 +996,7 @@ def _extract_response_text(data: dict) -> str:
                                 parts.append(t)
             text = "".join(parts).strip()
             if text:
-                return text
+                return sanitize_ai_text(text)
     return ""
 
 
