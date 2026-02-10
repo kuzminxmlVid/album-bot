@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v55-2026-02-09_190821-7fd0f276")
+BOT_VERSION = os.getenv("BOT_VERSION", "v58-2026-02-10_083127-a1e384c0")
 AI_CACHE_VERSION = 5  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
@@ -126,7 +126,18 @@ async def init_pg() -> None:
         )
         """)
 
-        # progress per (user, list)
+        
+        # per-user pending input (simple state machine)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_inputs (
+            user_id BIGINT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            payload TEXT,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+        """)
+
+# progress per (user, list)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_progress (
             user_id BIGINT NOT NULL,
@@ -394,6 +405,31 @@ async def set_selected_list(user_id: int, list_name: str) -> str:
             user_id, resolved, idx, now
         )
     return resolved
+
+
+
+async def db_set_user_input(user_id: int, mode: str, payload: Optional[str] = None) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """INSERT INTO user_inputs (user_id, mode, payload, updated_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT (user_id)
+               DO UPDATE SET mode=EXCLUDED.mode, payload=EXCLUDED.payload, updated_at=NOW()
+            """,
+            user_id, mode, payload,
+        )
+
+async def db_get_user_input(user_id: int) -> Optional[Dict]:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, mode, payload, updated_at FROM user_inputs WHERE user_id=$1",
+            user_id,
+        )
+        return dict(row) if row else None
+
+async def db_clear_user_input(user_id: int) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute("DELETE FROM user_inputs WHERE user_id=$1", user_id)
 
 async def get_index(user_id: int, list_name: str) -> int:
     async with _pool().acquire() as conn:
@@ -1394,6 +1430,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
         [InlineKeyboardButton(text="📈 Статистика+", callback_data="ui:stats_plus")],
         [InlineKeyboardButton(text="🔁 На переслушать", callback_data="ui:relisten_menu")],
+        [InlineKeyboardButton(text="🔎 Поиск артиста", callback_data="ui:find_artist")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
 def stats_plus_keyboard() -> InlineKeyboardMarkup:
@@ -1853,6 +1890,13 @@ def _parse_del_songlink_args(text: str) -> tuple[Optional[str], Optional[int]]:
 
 # ================= COMMANDS =================
 
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    await db_clear_user_input(message.from_user.id)
+    await message.answer("Окей, отменил.", reply_markup=menu_keyboard())
+
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
     if msg.chat.type != "private":
@@ -1988,6 +2032,128 @@ async def cmd_next_from(msg: Message):
     await set_index(user_id, resolved, idx - 1)
 
 @router.message(Command("go"))
+
+
+
+
+async def perform_find_artist(user_id: int, needle: str) -> Dict:
+    prog = await db_get_user_progress(user_id)
+    active_list = None
+    if isinstance(prog, dict):
+        active_list = prog.get("active_list") or prog.get("album_list") or prog.get("list")
+    if not active_list:
+        active_list = await get_selected_list(user_id)
+
+    lists_map = globals().get("ALBUM_LISTS") or globals().get("ALBUM_LISTS_DATA") or globals().get("ALBUM_LISTS_REGISTRY")
+    if not isinstance(lists_map, dict) or active_list not in lists_map:
+        return {"error": "Не могу найти выбранный список. Открой меню и выбери список заново."}
+
+    albums = lists_map[active_list]
+    if not isinstance(albums, list):
+        return {"error": "Список альбомов повреждён. Проверь загрузку CSV."}
+
+    needle_l = needle.lower()
+    matches = []
+    for item in albums:
+        artist = str(item.get("artist", ""))
+        album = str(item.get("album", ""))
+        rank = item.get("rank") or item.get("position") or item.get("id")
+        if needle_l in artist.lower():
+            try:
+                rank_int = int(rank)
+            except Exception:
+                rank_int = rank
+            matches.append((rank_int, artist, album))
+
+    if not matches:
+        return {"active_list": active_list, "matches": []}
+
+    matches.sort(key=lambda x: (x[0] if isinstance(x[0], int) else 10**9, x[1]))
+    matches = matches[:10]
+
+    kb = InlineKeyboardBuilder()
+    lines = [f"Нашёл в списке <b>{html.escape(str(active_list))}</b>:"]
+    for rank, artist, album in matches:
+        lines.append(f"{rank}. {html.escape(artist)} — {html.escape(album)}")
+        kb.button(text=f"GO {rank}", callback_data=f"go:{active_list}:{rank}")
+    kb.adjust(5)
+
+    return {"active_list": active_list, "matches": matches, "text": "\n".join(lines), "kb": kb.as_markup()}
+
+@router.message(Command("find_artist"))
+async def cmd_find_artist(message: Message):
+    """
+    Search artist within currently selected list and show rank+album with GO buttons.
+    Uses the user's active_list from user_progress.
+    """
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "Напиши так: <code>/find_artist имя_артиста</code>\n"
+            "Я поищу в текущем выбранном списке и покажу позиции.",
+            parse_mode="HTML",
+        )
+        return
+
+    needle = parts[1].strip().lower()
+    user_id = message.from_user.id
+
+    # get active list
+    active_list = None
+    try:
+        prog = db_get_user_progress(user_id)
+        if isinstance(prog, dict):
+            active_list = prog.get("active_list") or prog.get("album_list") or prog.get("list")
+    except Exception:
+        active_list = None
+
+    if not active_list:
+        await message.answer("Сначала выбери список альбомов в меню, потом используй поиск.")
+        return
+
+    lists_map = globals().get("ALBUM_LISTS") or globals().get("ALBUM_LISTS_DATA") or globals().get("ALBUM_LISTS_REGISTRY")
+    if not isinstance(lists_map, dict) or active_list not in lists_map:
+        await message.answer("Не могу найти выбранный список. Попробуй выбрать список заново в меню.")
+        return
+
+    albums = lists_map[active_list]
+    if not isinstance(albums, list):
+        await message.answer("Список альбомов повреждён. Проверь загрузку CSV.")
+        return
+
+    matches = []
+    for item in albums:
+        artist = str(item.get("artist", ""))
+        album = str(item.get("album", ""))
+        rank = item.get("rank") or item.get("position") or item.get("id")
+        if needle in artist.lower():
+            try:
+                rank_int = int(rank)
+            except Exception:
+                rank_int = rank
+            matches.append((rank_int, artist, album))
+
+    if not matches:
+        await message.answer(
+            f"В списке <b>{html.escape(str(active_list))}</b> не нашёл артиста: <b>{html.escape(parts[1])}</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    matches.sort(key=lambda x: (x[0] if isinstance(x[0], int) else 10**9, x[1]))
+    matches = matches[:10]
+
+    kb = InlineKeyboardBuilder()
+    lines = [f"Нашёл в списке <b>{html.escape(str(active_list))}</b>:"]
+    for rank, artist, album in matches:
+        lines.append(f"{rank}. {artist} — {album}")
+        kb.button(text=f"GO {rank}", callback_data=f"go:{active_list}:{rank}")
+    kb.adjust(5)
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb.as_markup())
+
+
 async def cmd_go(msg: Message):
     """
     Переход к конкретному альбому по ранку.
@@ -2036,6 +2202,38 @@ async def cmd_go(msg: Message):
         prefix=f"🎯 Переход к альбому #{rank}\nСписок: <b>{album_list}</b>",
     )
 
+
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def pending_text_handler(message: Message):
+    ui = await db_get_user_input(message.from_user.id)
+    if not ui:
+        return
+    if ui.get("mode") != "find_artist":
+        return
+
+    needle = (message.text or "").strip()
+    if not needle:
+        await message.answer("Пусто. Напиши имя артиста текстом, или /cancel чтобы отменить.")
+        return
+
+    res = await perform_find_artist(message.from_user.id, needle)
+    await db_clear_user_input(message.from_user.id)
+
+    if res.get("error"):
+        await message.answer(res["error"], reply_markup=menu_keyboard())
+        return
+
+    if not res.get("matches"):
+        await message.answer(
+            f"В списке <b>{html.escape(str(res.get('active_list')))}</b> не нашёл: <b>{html.escape(needle)}</b>.",
+            parse_mode="HTML",
+            reply_markup=menu_keyboard(),
+        )
+        return
+
+    await message.answer(res["text"], parse_mode="HTML", reply_markup=res["kb"])
 
 @router.message(Command("export_ratings"))
 async def cmd_export(msg: Message):
@@ -2216,6 +2414,18 @@ async def nav_cb(call: CallbackQuery):
 async def menu_cb(call: CallbackQuery):
     await call.answer()
     await call.message.answer("📋 Меню", reply_markup=menu_keyboard())
+
+
+@router.callback_query(F.data == "ui:find_artist")
+async def ui_find_artist_cb(call: CallbackQuery):
+    await call.answer()
+    await db_set_user_input(call.from_user.id, "find_artist", None)
+    await call.message.answer(
+        "🔎 Напиши имя артиста одним сообщением.\n"
+        "Я покажу его позиции в текущем списке и дам кнопки GO.\n\n"
+        "Отмена: /cancel",
+    )
+
 
 @router.callback_query(F.data == "ui:stats")
 async def stats_cb(call: CallbackQuery):
@@ -2617,11 +2827,12 @@ async def ai_artist_or_album(call: CallbackQuery):
         return
 
     info = await _album_by_rank(album_list, rank)
+    mode_key = f"{kind}:v{AI_CACHE_VERSION}"
     if not info:
         await call.message.answer("Не нашёл этот альбом в списке.")
         return
 
-    cached = await get_cached_ai_note(album_list, rank, kind)
+    cached = await get_cached_ai_note(album_list, rank, mode_key)
     if cached:
         title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
         await call.message.answer(
@@ -2639,7 +2850,7 @@ async def ai_artist_or_album(call: CallbackQuery):
 
     lock = _get_user_lock(call.from_user.id)
     async with lock:
-        cached2 = await get_cached_ai_note(album_list, rank, kind)
+        cached2 = await get_cached_ai_note(album_list, rank, mode_key)
         if cached2:
             title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
             await call.message.answer(
@@ -2728,7 +2939,7 @@ async def ai_artist_or_album(call: CallbackQuery):
             await thinking.edit_text("Не получилось получить ответ AI. Попробуй позже.")
             return
 
-        await set_cached_ai_note(album_list, rank, kind, text)
+        await set_cached_ai_note(album_list, rank, mode_key, text)
 
         title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
         await thinking.edit_text(
