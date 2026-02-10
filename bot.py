@@ -7,8 +7,8 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v58-2026-02-10_083127-a1e384c0")
-AI_CACHE_VERSION = 5  # bump to invalidate old AI cache
+BOT_VERSION = os.getenv("BOT_VERSION", "v59-2026-02-10_084957-9cd7b7d9")
+AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
@@ -655,6 +655,8 @@ def _ai_system_prompt_note() -> str:
 
 def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
     return (
+        "Пиши по-русски. Никакого английского. "
+
         "Сделай короткую справку об исполнителе. "
         "Используй ТОЛЬКО факты из входных данных (Last.fm / Wikipedia / MusicBrainz). "
         "Нельзя выдумывать. Нельзя добавлять ссылки. "
@@ -675,6 +677,8 @@ def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
 
 def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
     return (
+        "Пиши по-русски. Никакого английского. "
+
         "Сделай короткую справку об альбоме. "
         "Используй ТОЛЬКО факты из входных данных (Last.fm / Wikipedia / MusicBrainz). "
         "Нельзя выдумывать. Нельзя добавлять ссылки, дату релиза, лейбл, тип релиза, треклист. "
@@ -694,11 +698,21 @@ def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
     )
 
 def parse_ai_brief(text: str) -> dict:
-    """Parse 4-line structured AI output."""
+    """Parse 4-line structured AI output.
+    Preferred format:
+      IDEA: ...
+      SOUND: ...
+      THEMES: ...
+      FEATURE: ...
+    Fallback:
+      if markers missing, take first 4 non-empty lines as idea/sound/themes/feature.
+    """
     out = {"idea": "нет данных", "sound": "нет данных", "themes": "нет данных", "feature": "нет данных"}
     if not text:
         return out
-    for line in text.splitlines():
+
+    found = 0
+    for line in (text or "").splitlines():
         m = re.match(r"^\s*(IDEA|SOUND|THEMES|FEATURE)\s*:\s*(.*)\s*$", line, re.I)
         if not m:
             continue
@@ -712,7 +726,50 @@ def parse_ai_brief(text: str) -> dict:
             out["themes"] = val
         elif key == "FEATURE":
             out["feature"] = val
+        found += 1
+
+    if found == 0:
+        # fallback: sequential lines
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if len(lines) >= 1:
+            out["idea"] = lines[0]
+        if len(lines) >= 2:
+            out["sound"] = lines[1]
+        if len(lines) >= 3:
+            out["themes"] = lines[2]
+        if len(lines) >= 4:
+            out["feature"] = lines[3]
     return out
+
+
+def render_ai_note(kind: str, info: dict, slim_facts: dict, ai_text: str) -> str:
+    brief = parse_ai_brief(ai_text or "")
+    track_count = (slim_facts or {}).get("track_count") if isinstance(slim_facts, dict) else None
+
+    if kind == "album":
+        body = (
+            f"<b>💿 Об альбоме</b>\n"
+            f"{html.escape(str(info.get('artist','')))} — {html.escape(str(info.get('album','')))}\n\n"
+            f"Коротко:\n"
+            f"• 🎭 <b>Идея</b> {html.escape(brief['idea'])}\n"
+            f"• 🎧 <b>Звук</b> {html.escape(brief['sound'])}\n"
+            f"• ✍️ <b>Темы</b> {html.escape(brief['themes'])}\n"
+            f"• 🧠 <b>Фишка</b> {html.escape(brief['feature'])}\n"
+        )
+        if isinstance(track_count, int) and track_count > 0:
+            body += f"\nТреков {track_count}"
+        return body
+
+    body = (
+        f"<b>👤 Об артисте</b>\n"
+        f"{html.escape(str(info.get('artist','')))}\n\n"
+        f"Коротко:\n"
+        f"• 🎭 <b>Кто это</b> {html.escape(brief['idea'])}\n"
+        f"• 🎧 <b>Звук</b> {html.escape(brief['sound'])}\n"
+        f"• ✍️ <b>Темы</b> {html.escape(brief['themes'])}\n"
+        f"• 🧠 <b>Фишка</b> {html.escape(brief['feature'])}\n"
+    )
+    return body
 
 def sanitize_ai_text(text: str) -> str:
     if not text:
@@ -2833,6 +2890,8 @@ async def ai_artist_or_album(call: CallbackQuery):
         return
 
     cached = await get_cached_ai_note(album_list, rank, mode_key)
+        # render cached in current UI format
+
     if cached:
         title = "👤 Об артисте" if kind == "artist" else "💿 Об альбоме"
         await call.message.answer(
@@ -2902,6 +2961,7 @@ async def ai_artist_or_album(call: CallbackQuery):
                 'track_count': facts.get('track_count'),
             }
             text = await openai_generate_note(kind, slim_facts, wiki, lastfm)
+            body = render_ai_note(kind, info, slim_facts, text)
         
             brief = parse_ai_brief(text or "")
             track_count = (slim_facts or {}).get("track_count") if isinstance(slim_facts, dict) else None
