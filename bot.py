@@ -1446,7 +1446,7 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
     enc = encode_list_name(album_list)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
-            [InlineKeyboardButton(text=fav_text, callback_data=f"fav:toggle:{album_list}:{rank}"), InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), InlineKeyboardButton(text="💿 Об альбоме", callback_data=f"ai:album:{album_list}:{rank}")],
+            [InlineKeyboardButton(text=fav_text, callback_data=f"fav:toggle:{album_list}:{rank}"), InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), ],
         [
             InlineKeyboardButton(text="Предыдущий", callback_data="nav:prev"),
             InlineKeyboardButton(text="Следующий", callback_data="nav:next"),
@@ -2743,6 +2743,10 @@ async def ai_generate(call: CallbackQuery):
         await call.message.answer("Не понял запрос.")
         return
 
+
+    if kind != "artist":
+        await call.message.answer("Функция \"Об альбоме\" отключена. Используй кнопку \"Об артисте\".")
+        return
     if not OPENAI_API_KEY:
         await call.message.answer("AI не настроен. Добавь переменную OPENAI_API_KEY в Railway.")
         return
