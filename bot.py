@@ -1500,10 +1500,6 @@ def rating_keyboard(album_list: str, rank: int, ctx: str) -> InlineKeyboardMarku
 
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
-        [InlineKeyboardButton(text="⏭ Следующий", callback_data="nav:next")],
-        [InlineKeyboardButton(text="⏮ Предыдущий", callback_data="nav:prev")],
-        [InlineKeyboardButton(text="🧭 Перейти (go)", callback_data="ui:go")],
         [InlineKeyboardButton(text="❤️ Любимые", callback_data="ui:favs")],
         [InlineKeyboardButton(text="⭐️ Рейтинг", callback_data="ui:rate_menu")],
         [InlineKeyboardButton(text="🔁 Переслушивание", callback_data="ui:relisten_menu")],
