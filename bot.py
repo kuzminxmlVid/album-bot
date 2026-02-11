@@ -9,7 +9,7 @@ import html
 
 BOT_VERSION = os.getenv("BOT_VERSION", "v61-2026-02-10_084957-9cd7b7d9")
 AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
 from datetime import datetime, timezone, date, timedelta
 from zoneinfo import ZoneInfo
