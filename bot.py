@@ -2122,8 +2122,7 @@ async def perform_find_artist(user_id: int, needle: str) -> Dict[str, Any]:
     kb.button(text="Меню", callback_data="menu")
     kb.adjust(2)
 
-    return {"active_list": active_list, "matches": matches, "text": "
-".join(lines_out), "kb": kb.as_markup()}
+    return {"active_list": active_list, "matches": matches, "text": "\n".join(lines_out), "kb": kb.as_markup()}
 @router.message(Command("find_artist"))
 async def cmd_find_artist(message: Message):
     """
