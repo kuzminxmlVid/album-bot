@@ -397,6 +397,15 @@ async def ensure_user(user_id: int) -> str:
 async def get_selected_list(user_id: int) -> str:
     return await ensure_user(user_id)
 
+async def db_get_user_progress(user_id: int) -> Dict[str, Any]:
+    """Compatibility shim for older code paths (search, etc.)."""
+    active_list = await get_selected_list(user_id)
+    try:
+        idx = await get_index(user_id, active_list)
+    except Exception:
+        idx = 0
+    return {"album_list": active_list, "current_index": idx, "active_list": active_list, "index": idx}
+
 async def set_selected_list(user_id: int, list_name: str) -> str:
     resolved = resolve_list_name(list_name)
     if not resolved:
@@ -2058,50 +2067,63 @@ async def cmd_next_from(msg: Message):
 
 
 
-async def perform_find_artist(user_id: int, needle: str) -> Dict:
-    prog = await db_get_user_progress(user_id)
-    active_list = None
-    if isinstance(prog, dict):
-        active_list = prog.get("active_list") or prog.get("album_list") or prog.get("list")
-    if not active_list:
-        active_list = await get_selected_list(user_id)
+async def perform_find_artist(user_id: int, needle: str) -> Dict[str, Any]:
+    """Search artist within the currently selected list and return GO buttons."""
+    needle_norm = (needle or "").strip()
+    if not needle_norm:
+        return {"error": "Пустой запрос"}
 
-    lists_map = globals().get("ALBUM_LISTS") or globals().get("ALBUM_LISTS_DATA") or globals().get("ALBUM_LISTS_REGISTRY")
-    if not isinstance(lists_map, dict) or active_list not in lists_map:
-        return {"error": "Не могу найти выбранный список. Открой меню и выбери список заново."}
+    active_list = (await get_selected_list(user_id)) if user_id else (resolve_list_name(Config.DEFAULT_LIST) or Config.DEFAULT_LIST)
 
-    albums = lists_map[active_list]
-    if not isinstance(albums, list):
-        return {"error": "Список альбомов повреждён. Проверь загрузку CSV."}
+    try:
+        df = get_albums(active_list)
+    except Exception as e:
+        return {"error": f"Не могу открыть список {active_list}: {e}"}
 
-    needle_l = needle.lower()
-    matches = []
-    for item in albums:
-        artist = str(item.get("artist", ""))
-        album = str(item.get("album", ""))
-        rank = item.get("rank") or item.get("position") or item.get("id")
-        if needle_l in artist.lower():
-            try:
-                rank_int = int(rank)
-            except Exception:
-                rank_int = rank
-            matches.append((rank_int, artist, album))
+    q = needle_norm.lower()
+    # artist column is required; guard anyway
+    if "artist" not in df.columns:
+        return {"error": "В этом списке нет колонки artist"}
+
+    mask = df["artist"].astype(str).str.lower().str.contains(re.escape(q), na=False)
+    hits = df[mask].head(20)
+
+    matches: List[Dict[str, Any]] = []
+    for _, row in hits.iterrows():
+        matches.append({
+            "rank": int(row.get("rank")) if pd.notna(row.get("rank")) else None,
+            "artist": str(row.get("artist") or ""),
+            "album": str(row.get("album") or ""),
+            "year": str(row.get("year") or row.get("год") or ""),
+        })
 
     if not matches:
         return {"active_list": active_list, "matches": []}
 
-    matches.sort(key=lambda x: (x[0] if isinstance(x[0], int) else 10**9, x[1]))
-    matches = matches[:10]
+    # Build message text
+    lines_out = [f"Нашёл в списке <b>{html.escape(active_list)}</b>:", ""]
+    for m in matches[:10]:
+        r = m.get("rank")
+        a = html.escape(m.get("artist", ""))
+        al = html.escape(m.get("album", ""))
+        y = m.get("year", "")
+        y_txt = f" ({html.escape(y)})" if y else ""
+        if r is not None:
+            lines_out.append(f"<b>{r}</b>. {a} — {al}{y_txt}")
+        else:
+            lines_out.append(f"{a} — {al}{y_txt}")
 
     kb = InlineKeyboardBuilder()
-    lines = [f"Нашёл в списке <b>{html.escape(str(active_list))}</b>:"]
-    for rank, artist, album in matches:
-        lines.append(f"{rank}. {html.escape(artist)} — {html.escape(album)}")
-        kb.button(text=f"GO {rank}", callback_data=f"go:{active_list}:{rank}")
-    kb.adjust(5)
+    for m in matches[:10]:
+        r = m.get("rank")
+        if r is None:
+            continue
+        kb.button(text=f"GO {r}", callback_data=f"go:{encode_list_name(active_list)}:{r}")
+    kb.button(text="Меню", callback_data="menu")
+    kb.adjust(2)
 
-    return {"active_list": active_list, "matches": matches, "text": "\n".join(lines), "kb": kb.as_markup()}
-
+    return {"active_list": active_list, "matches": matches, "text": "
+".join(lines_out), "kb": kb.as_markup()}
 @router.message(Command("find_artist"))
 async def cmd_find_artist(message: Message):
     """
@@ -2564,6 +2586,33 @@ async def setlist_cb(call: CallbackQuery):
     if intro:
         await call.message.answer(intro)
     await send_album_post(call.from_user.id, resolved, idx, ctx="flow")
+
+
+@router.callback_query(F.data.startswith("go:"))
+async def go_cb(call: CallbackQuery):
+    try:
+        _, enc_list, rank_s = (call.data or "").split(":", 2)
+        album_list = decode_list_name(enc_list)
+        resolved = resolve_list_name(album_list) or album_list
+        rank = int(rank_s)
+    except Exception:
+        await call.answer("Не понял куда прыгать", show_alert=True)
+        return
+
+    try:
+        idx = find_index_by_rank(resolved, rank)
+        if idx is None:
+            await call.answer("Такого rank нет в списке", show_alert=True)
+            return
+
+        # ensure selected list matches jump target
+        await set_selected_list(call.from_user.id, resolved)
+        await set_index(call.from_user.id, resolved, idx)
+        await send_album_post(call.from_user.id, resolved, idx, ctx="go")
+        await call.answer()
+    except Exception as e:
+        log.exception("go_cb failed")
+        await call.answer(f"Ошибка: {e}", show_alert=True)
 
 @router.callback_query(F.data == "ui:daily")
 async def ui_daily(call: CallbackQuery):
