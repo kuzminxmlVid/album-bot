@@ -3,13 +3,11 @@ import re
 import csv
 import io
 import asyncio
-import random
-from pathlib import Path
 import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v64-2026-02-10_084957-9cd7b7d9")
+BOT_VERSION = os.getenv("BOT_VERSION", "v61-2026-02-10_084957-9cd7b7d9")
 AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
@@ -115,6 +113,13 @@ def _pool() -> asyncpg.Pool:
     if pg_pool is None:
         raise RuntimeError("Postgres pool is not initialized")
     return pg_pool
+
+async def get_db_pool() -> asyncpg.Pool:
+    """Compatibility helper.
+
+    Some earlier revisions used `get_db_pool()`; keep it to avoid NameError.
+    """
+    return _pool()
 
 async def init_pg() -> None:
     global pg_pool
@@ -429,67 +434,38 @@ async def db_get_user_input(user_id: int) -> Optional[Dict]:
         )
         return dict(row) if row else None
 
-async def db_get_user_progress(user_id: int) -> dict:
-    """Совместимость: раньше код ожидал эту функцию. Возвращаем текущий список и индекс."""
-    try:
-        album_list = await get_selected_list(user_id)
-    except Exception:
-        album_list = "top100"
-    try:
-        idx = await get_index(user_id)
-    except Exception:
-        idx = 0
-    return {"album_list": album_list or "top100", "index": int(idx or 0)}
-
-
 async def db_clear_user_input(user_id: int) -> None:
     async with _pool().acquire() as conn:
         await conn.execute("DELETE FROM user_inputs WHERE user_id=$1", user_id)
 
-async def get_index(user_id: int, album_list: str | None = None) -> int:
-    """Get current index for user.
-
-    Back-compat: if album_list is None, uses selected list.
-    """
-    if album_list is None:
-        album_list = await get_selected_list(user_id)
-
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
+async def get_index(user_id: int, list_name: str) -> int:
+    async with _pool().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT current_index FROM user_progress WHERE user_id=$1 AND album_list=$2",
-            user_id,
-            album_list,
+            user_id, list_name
         )
-        return int(row["current_index"]) if row and row["current_index"] is not None else 0
-
-async def set_index(user_id: int, album_list_or_idx, idx: int | None = None) -> None:
-    """Set current index.
-
-    Supports two call styles for back-compat:
-      - set_index(user_id, album_list, idx)
-      - set_index(user_id, idx)  # uses selected list
-    """
-    if idx is None:
-        album_list = await get_selected_list(user_id)
-        idx = int(album_list_or_idx)
-    else:
-        album_list = str(album_list_or_idx)
-        idx = int(idx)
-
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
+        if row:
+            return int(row["current_index"])
+        albums = get_albums(list_name)
+        idx = len(albums) - 1
+        now = datetime.now(timezone.utc)
         await conn.execute(
-            """
-            INSERT INTO user_progress (user_id, album_list, current_index)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, album_list)
-            DO UPDATE SET current_index = EXCLUDED.current_index
-            """,
-            user_id,
-            album_list,
-            idx,
+            "INSERT INTO user_progress (user_id, album_list, current_index, updated_at) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index, updated_at=EXCLUDED.updated_at",
+            user_id, list_name, idx, now
         )
+        return idx
+
+async def set_index(user_id: int, list_name: str, idx: int) -> None:
+    now = datetime.now(timezone.utc)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_progress (user_id, album_list, current_index, updated_at) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index, updated_at=EXCLUDED.updated_at",
+            user_id, list_name, idx, now
+        )
+
+# ================= HTTP =================
 
 async def init_http() -> None:
     global http_session
@@ -699,21 +675,7 @@ def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
         f"Last.fm: {json.dumps(lastfm, ensure_ascii=False)}\n"
     )
 
-def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
-    wiki = wiki or {}
-    lastfm = lastfm or {}
-    facts = facts or {}
-    return (
-        "СТРОГО ПО-РУССКИ. Никакого английского.\n"
-        "Сделай справку ОБ АЛЬБОМЕ.\n"
-        "Пиши только факты из данных ниже. Не выдумывай.\n"
-        "Формат 4–8 коротких строк, можно эмодзи.\n"
-        "Ссылки не добавляй.\n"
-        "Добавь строку: 🎛 Треков: N (если N есть во входных данных).\n\n"
-        f"MusicBrainz facts: {json.dumps(facts, ensure_ascii=False)}\n"
-        f"Wikipedia: {json.dumps(wiki, ensure_ascii=False)}\n"
-        f"Last.fm: {json.dumps(lastfm, ensure_ascii=False)}\n"
-    )
+
 def parse_ai_brief(text: str) -> dict:
     """Parse 4-line structured AI output.
     Preferred format:
@@ -762,20 +724,6 @@ def parse_ai_brief(text: str) -> dict:
 def render_ai_note(kind: str, info: dict, slim_facts: dict, ai_text: str) -> str:
     brief = parse_ai_brief(ai_text or "")
     track_count = (slim_facts or {}).get("track_count") if isinstance(slim_facts, dict) else None
-
-    if kind == "album":
-        body = (
-            f"<b>💿 Об альбоме</b>\n"
-            f"{html.escape(str(info.get('artist','')))} — {html.escape(str(info.get('album','')))}\n\n"
-            f"Коротко:\n"
-            f"• 🎭 <b>Идея</b> {html.escape(brief['idea'])}\n"
-            f"• 🎧 <b>Звук</b> {html.escape(brief['sound'])}\n"
-            f"• ✍️ <b>Темы</b> {html.escape(brief['themes'])}\n"
-            f"• 🧠 <b>Фишка</b> {html.escape(brief['feature'])}\n"
-        )
-        if isinstance(track_count, int) and track_count > 0:
-            body += f"\nТреков {track_count}"
-        return body
 
     body = (
         f"<b>👤 Об артисте</b>\n"
@@ -1500,13 +1448,13 @@ def rating_keyboard(album_list: str, rank: int, ctx: str) -> InlineKeyboardMarku
 
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❤️ Любимые", callback_data="ui:favs")],
-        [InlineKeyboardButton(text="⭐️ Рейтинг", callback_data="ui:rate_menu")],
-        [InlineKeyboardButton(text="🔁 Переслушивание", callback_data="ui:relisten_menu")],
+        [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
+        [InlineKeyboardButton(text="📈 Статистика+", callback_data="ui:stats_plus")],
+        [InlineKeyboardButton(text="🔁 Переслушать", callback_data="ui:relisten_menu")],
         [InlineKeyboardButton(text="🔎 Поиск артиста", callback_data="ui:find_artist")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
-
 def stats_plus_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏆 Топ-10", callback_data="ui:top")],
@@ -2105,45 +2053,56 @@ async def cmd_next_from(msg: Message):
     )
     await set_index(user_id, resolved, idx - 1)
 
-async def perform_find_artist(user_id: int, needle: str) -> dict:
-    needle = (needle or "").strip()
-    if not needle:
-        return {"text": "Введите имя артиста.", "kb": None}
+@router.message(Command("go"))
 
-    album_list = await get_selected_list(user_id)
-    df = get_albums(album_list)
 
-    if df is None or df.empty or "artist" not in df.columns:
-        return {"text": "Список пуст или не загружен.", "kb": None}
 
-    # case-insensitive substring search
-    mask = df["artist"].fillna("").astype(str).str.lower().str.contains(needle.lower())
-    hits = df[mask].head(12)
 
-    if hits.empty:
-        return {"text": f"Не нашёл в списке: {needle}", "kb": None}
+async def perform_find_artist(user_id: int, needle: str) -> Dict:
+    prog = await db_get_user_progress(user_id)
+    active_list = None
+    if isinstance(prog, dict):
+        active_list = prog.get("active_list") or prog.get("album_list") or prog.get("list")
+    if not active_list:
+        active_list = await get_selected_list(user_id)
 
-    lines = [f"Найдено в списке: {album_list}", ""]
-    buttons: list[list[InlineKeyboardButton]] = []
+    lists_map = globals().get("ALBUM_LISTS") or globals().get("ALBUM_LISTS_DATA") or globals().get("ALBUM_LISTS_REGISTRY")
+    if not isinstance(lists_map, dict) or active_list not in lists_map:
+        return {"error": "Не могу найти выбранный список. Открой меню и выбери список заново."}
 
-    row: list[InlineKeyboardButton] = []
-    for _, r in hits.iterrows():
-        rank = int(r.get("rank", 0) or 0)
-        artist = str(r.get("artist", "") or "").strip()
-        album = str(r.get("album", "") or "").strip()
-        lines.append(f"• #{rank}: {artist} — {album}")
+    albums = lists_map[active_list]
+    if not isinstance(albums, list):
+        return {"error": "Список альбомов повреждён. Проверь загрузку CSV."}
 
-        if rank > 0:
-            row.append(InlineKeyboardButton(text=f"GO #{rank}", callback_data=f"go:{album_list}:{rank}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-    if row:
-        buttons.append(row)
+    needle_l = needle.lower()
+    matches = []
+    for item in albums:
+        artist = str(item.get("artist", ""))
+        album = str(item.get("album", ""))
+        rank = item.get("rank") or item.get("position") or item.get("id")
+        if needle_l in artist.lower():
+            try:
+                rank_int = int(rank)
+            except Exception:
+                rank_int = rank
+            matches.append((rank_int, artist, album))
 
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    return {"text": "\n".join(lines), "kb": kb}
+    if not matches:
+        return {"active_list": active_list, "matches": []}
 
+    matches.sort(key=lambda x: (x[0] if isinstance(x[0], int) else 10**9, x[1]))
+    matches = matches[:10]
+
+    kb = InlineKeyboardBuilder()
+    lines = [f"Нашёл в списке <b>{html.escape(str(active_list))}</b>:"]
+    for rank, artist, album in matches:
+        lines.append(f"{rank}. {html.escape(artist)} — {html.escape(album)}")
+        kb.button(text=f"GO {rank}", callback_data=f"go:{active_list}:{rank}")
+    kb.adjust(5)
+
+    return {"active_list": active_list, "matches": matches, "text": "\n".join(lines), "kb": kb.as_markup()}
+
+@router.message(Command("find_artist"))
 async def cmd_find_artist(message: Message):
     """
     Search artist within currently selected list and show rank+album with GO buttons.
@@ -2165,7 +2124,7 @@ async def cmd_find_artist(message: Message):
     # get active list
     active_list = None
     try:
-        prog = await db_get_user_progress(user_id)
+        prog = db_get_user_progress(user_id)
         if isinstance(prog, dict):
             active_list = prog.get("active_list") or prog.get("album_list") or prog.get("list")
     except Exception:
@@ -2217,7 +2176,6 @@ async def cmd_find_artist(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb.as_markup())
 
 
-@router.message(Command("go"))
 async def cmd_go(msg: Message):
     """
     Переход к конкретному альбому по ранку.
@@ -2269,32 +2227,6 @@ async def cmd_go(msg: Message):
 
 
 
-@router.callback_query(F.data.startswith("go:"))
-async def go_cb(call: CallbackQuery):
-    await call.answer()
-    user_id = call.from_user.id
-
-    try:
-        _, album_list, rank_s = (call.data or "").split(":", 2)
-        rank = int(rank_s)
-    except Exception:
-        await call.message.answer("Не понял, куда идти. Попробуй ещё раз.")
-        return
-
-    df = get_albums(album_list)
-    if df is None or df.empty:
-        await call.message.answer("В этом списке нет альбомов.")
-        return
-
-    # rank — это место (1..N)
-    hits = df.index[df["rank"] == rank].tolist() if "rank" in df.columns else []
-    if hits:
-        idx = int(hits[0])
-    else:
-        idx = max(0, min(rank - 1, len(df) - 1))
-
-    await set_index(user_id, album_list, idx)
-    await send_album_post(user_id, album_list, idx)
 @router.message(F.text & ~F.text.startswith("/"))
 async def pending_text_handler(message: Message):
     ui = await db_get_user_input(message.from_user.id)
@@ -2304,17 +2236,28 @@ async def pending_text_handler(message: Message):
         return
 
     needle = (message.text or "").strip()
-    await db_clear_user_input(message.from_user.id)
+    if not needle:
+        await message.answer("Пусто. Напиши имя артиста текстом, или /cancel чтобы отменить.")
+        return
 
     res = await perform_find_artist(message.from_user.id, needle)
-    text = res.get("text") or ""
-    kb = res.get("kb")
+    await db_clear_user_input(message.from_user.id)
 
-    if kb:
-        await message.answer(text, reply_markup=kb)
-    else:
-        await message.answer(text, reply_markup=menu_keyboard())
+    if res.get("error"):
+        await message.answer(res["error"], reply_markup=menu_keyboard())
+        return
 
+    if not res.get("matches"):
+        await message.answer(
+            f"В списке <b>{html.escape(str(res.get('active_list')))}</b> не нашёл: <b>{html.escape(needle)}</b>.",
+            parse_mode="HTML",
+            reply_markup=menu_keyboard(),
+        )
+        return
+
+    await message.answer(res["text"], parse_mode="HTML", reply_markup=res["kb"])
+
+@router.message(Command("export_ratings"))
 async def cmd_export(msg: Message):
     data = await export_ratings_csv(msg.from_user.id)
     await msg.answer_document(BufferedInputFile(data, filename="ratings.csv"))
@@ -2462,74 +2405,39 @@ async def cb_noop(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("nav:"))
 async def nav_cb(call: CallbackQuery):
-    await call.answer()
     user_id = call.from_user.id
+    album_list = await ensure_user(user_id)
+    idx = await get_index(user_id, album_list)
+    action = call.data.split(":", 1)[1]
 
-    parts = (call.data or "").split(":")
-    if len(parts) < 2:
-        return
-    direction = parts[1]  # prev / next
-
-    album_list = await get_selected_list(user_id)
-    df = get_albums(album_list)
-    if df is None or df.empty:
-        await call.message.answer("В этом списке нет альбомов.")
+    if action == "next":
+        await set_index(user_id, album_list, idx - 1)
+        await call.answer()
+        await send_album_post(user_id, album_list, idx - 1, ctx="flow")
         return
 
-    cur = await get_index(user_id, album_list)
-    cur = int(cur) if cur is not None else 0
-    cur = max(0, min(cur, len(df) - 1))
+    if action == "prev":
+        await set_index(user_id, album_list, idx + 1)
+        await call.answer()
+        await send_album_post(user_id, album_list, idx + 1, ctx="flow")
+        return
 
-    if direction == "next":
-        new_idx = cur - 1
-    else:
-        new_idx = cur + 1
+    if action == "reset":
+        albums = get_albums(album_list)
+        new_idx = len(albums) - 1
+        await set_index(user_id, album_list, new_idx)
+        await call.answer("Сброшено")
+        await send_album_post(user_id, album_list, new_idx, ctx="flow")
+        return
 
-    if new_idx < 0:
-        new_idx = len(df) - 1
-    if new_idx >= len(df):
-        new_idx = 0
+    await call.answer()
 
-    await set_index(user_id, album_list, new_idx)
-    await send_album_post(user_id, album_list, new_idx)
 @router.callback_query(F.data == "ui:menu")
 async def menu_cb(call: CallbackQuery):
     await call.answer()
     await call.message.answer("📋 Меню", reply_markup=menu_keyboard())
 
-@router.callback_query(F.data == "ui:rate_menu")
-async def ui_rate_menu_cb(cb: CallbackQuery):
-    await cb.answer()
-    user_id = cb.from_user.id
 
-    album_list = await get_selected_list(user_id)
-    df = get_albums(album_list)
-    if df is None or df.empty:
-        await cb.message.edit_text("В этом списке нет альбомов.", reply_markup=main_menu_kb())
-        return
-
-    idx = await get_index(user_id, album_list)
-    idx = int(idx) if idx is not None else 0
-    idx = max(0, min(idx, len(df) - 1))
-    row = df.iloc[idx]
-
-    rank = int(row.get("rank", idx + 1))
-    title = str(row.get("album", "") or row.get("title", "") or "Без названия").strip()
-    artist = str(row.get("artist", "") or "Неизвестный артист").strip()
-
-    text = (
-        "⭐️ Рейтинг\n\n"
-        f"Текущий: {rank}. {artist} — {title}\n\n"
-        "Что делаем?"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐️ Оценить текущий", callback_data=f"ui:rate:{album_list}:{rank}:menu")],
-        [InlineKeyboardButton(text="🏆 Топ", callback_data=f"ui:top:{album_list}")],
-        [InlineKeyboardButton(text="👎 Анти-топ", callback_data=f"ui:bottom:{album_list}")],
-        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="ui:menu")],
-    ])
-    await cb.message.edit_text(text, reply_markup=kb)
 @router.callback_query(F.data == "ui:find_artist")
 async def ui_find_artist_cb(call: CallbackQuery):
     await call.answer()
@@ -2541,42 +2449,7 @@ async def ui_find_artist_cb(call: CallbackQuery):
     )
 
 
-@router.callback_query(F.data == "ui:favs")
-@router.callback_query(F.data == "ui:favs")
-async def ui_favs_cb(cb: CallbackQuery):
-    await cb.answer()
-    user_id = cb.from_user.id
-
-    favs = await list_favorites(user_id)
-    if not favs:
-        await cb.message.edit_text(
-            "❤️ Любимые пустые.\n\n"
-            "Чтобы добавить альбом в любимые — открой альбом и нажми «❤️ В любимые».",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    # list_favorites -> List[Tuple[list_name, rank]]
-    favs = favs[:25]
-
-    rows = []
-    buttons = []
-    for n, (album_list, rank) in enumerate(favs, 1):
-        df = get_albums(album_list)
-        title = "Без названия"
-        artist = "Неизвестный артист"
-        if df is not None and not df.empty and "rank" in df.columns:
-            hit = df[df["rank"] == int(rank)]
-            if not hit.empty:
-                r = hit.iloc[0]
-                title = str(r.get("album", "") or r.get("title", "") or title).strip()
-                artist = str(r.get("artist", "") or artist).strip()
-
-        rows.append(f"{n}. {artist} — {title} ({album_list} #{rank})")
-        buttons.append([InlineKeyboardButton(text=f"▶️ {n}", callback_data=f"go:{album_list}:{int(rank)}")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons + [[InlineKeyboardButton(text="⬅️ В меню", callback_data="ui:menu")]])
-    await cb.message.edit_text("❤️ Любимые\n\n" + "\n".join(rows), reply_markup=kb)
+@router.callback_query(F.data == "ui:stats")
 async def stats_cb(call: CallbackQuery):
     txt = await build_stats_text(call.from_user.id)
     await call.answer()
@@ -2749,43 +2622,30 @@ async def rate_ui(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("rate:"))
 async def rate_set(call: CallbackQuery):
-    # отвечаем сразу, чтобы не было "кнопка устарела"
-    await call.answer()
-    user_id = call.from_user.id
-
-    parts = (call.data or "").split(":")
-    if len(parts) < 4:
-        return
-    _, value_s, album_list, rank_s = parts[:4]
-
-    try:
-        value = int(value_s)
-        rank = int(rank_s)
-    except Exception:
+    parts = call.data.split(":")
+    if len(parts) != 5:
+        await call.answer("Ошибка кнопки", show_alert=True)
         return
 
-    if value < 0 or value > 5:
-        return
+    rating = int(parts[1])
+    album_list = canonical_list_name(parts[2])
+    album_list = resolve_list_name(album_list) or album_list
+    rank = int(parts[3])
+    ctx = parts[4]
 
-    await upsert_rating(user_id, album_list, rank, value)
-    await edit_album_post(call, album_list, rank, prefix="👍" if value >= 4 else ("👎" if 0 < value <= 2 else ""))
+    await upsert_rating(call.from_user.id, album_list, rank, rating)
+    await call.answer(f"⭐ {rating} сохранено")
 
-    # если после оценки хочется листать дальше — листаем
-    df = get_albums(album_list)
-    if df is None or df.empty or "rank" not in df.columns:
-        return
+    await edit_album_post(call, album_list, rank, ctx)
 
-    idx = df.index[df["rank"] == rank].tolist()
-    if not idx:
-        return
+    # Only auto-advance in main flow
+    if ctx == "flow":
+        idx = await get_index(call.from_user.id, album_list)
+        albums = get_albums(album_list)
+        if 0 <= idx < len(albums) and int(albums.iloc[idx]["rank"]) == rank:
+            await set_index(call.from_user.id, album_list, idx - 1)
+            await send_album_post(call.from_user.id, album_list, idx - 1, ctx="flow")
 
-    cur = int(idx[0])
-    nxt = cur - 1
-    if nxt < 0:
-        nxt = len(df) - 1
-
-    await set_index(user_id, album_list, nxt)
-    await send_album_post(user_id, album_list, nxt)
 @router.callback_query(F.data.startswith("ui:back:"))
 async def back(call: CallbackQuery):
     parts = call.data.split(":")
@@ -2960,6 +2820,17 @@ async def cmd_favorites(message: Message):
             lines.append(f"{lst} #{rk}")
     await message.answer("\n".join(lines))
 
+@router.message(Command("rand_favorite"))
+async def cmd_rand_favorite(message: Message):
+    item = await random_favorite(message.from_user.id)
+    if not item:
+        await message.answer("Любимых альбомов пока нет.")
+        return
+    lst, rk = item
+    await set_selected_list(message.from_user.id, lst)
+    await set_progress(message.from_user.id, lst, rk)
+    await send_album_post(message.from_user.id, lst)
+
 @router.message(Command("version"))
 async def cmd_version(msg: Message):
     await msg.answer(f"Версия бота: {BOT_VERSION}")
@@ -3122,41 +2993,36 @@ async def cb_legacy_nav(call: CallbackQuery):
         return await nav_cb(call)
 
 @router.callback_query(lambda c: c.data and c.data.startswith("fav:toggle:"))
-async def fav_toggle(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    _, _, album_list, rank_str = cb.data.split(":", 3)
-    rank = int(rank_str)
+async def fav_toggle(call: CallbackQuery):
+    try:
+        _, _, album_list, rank_s = call.data.split(":", 3)
+        rank = int(rank_s)
+    except Exception:
+        await call.answer("Ошибка.", show_alert=True)
+        return
 
-    new_state = await toggle_favorite(user_id, album_list, rank)
+    new_state = await toggle_favorite(call.from_user.id, album_list, rank)
+    await call.answer("Добавлено в любимое" if new_state else "Убрано из любимого")
 
-    # Rebuild keyboard for the same album card
-    df = get_albums(album_list)
-    if df is not None and not df.empty:
-        row = df[df["rank"] == rank].head(1)
-        if not row.empty:
-            artist = str(row.iloc[0].get("artist", "") or "")
-            album = str(row.iloc[0].get("album", "") or "")
-            listen_url = get_songlink_url(artist, album)
+    # Update keyboard badge in-place
+    try:
+        info = await _album_by_rank(album_list, rank)
+        if not info:
+            return
+        rated = await get_rating(call.from_user.id, album_list, rank)
+        in_relisten = await is_in_relisten(call.from_user.id, album_list, rank)
+        listen_url = await get_songlink_url(album_list, rank, info["artist"], info["album"])
+        kb = album_keyboard(
+            album_list, rank, info["artist"], info["album"],
+            rated, ctx="post", listen_url=listen_url,
+            in_relisten=in_relisten, is_fav=new_state
+        )
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception as e:
+        log.debug("fav toggle edit markup failed: %s", e)
 
-            rated = (await get_user_rating(user_id, album_list, rank)) is not None
-            in_relisten = await is_relisten(user_id, album_list, rank)
 
-            kb = album_keyboard(
-                album_list=album_list,
-                rank=rank,
-                is_fav=new_state,
-                rated=rated,
-                in_relisten=in_relisten,
-                listen_url=listen_url,
-                ctx="post",
-            )
-            try:
-                await cb.message.edit_reply_markup(reply_markup=kb)
-            except Exception:
-                # if message can't be edited (e.g., old), ignore
-                pass
 
-    await cb.answer("Добавлено в ❤️" if new_state else "Убрано из ❤️")
 
 @router.callback_query()
 async def cb_unknown_callback(call: CallbackQuery):
