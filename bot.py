@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v59-2026-02-10_084957-9cd7b7d9")
+BOT_VERSION = os.getenv("BOT_VERSION", "v61-2026-02-10_084957-9cd7b7d9")
 AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
@@ -668,21 +668,7 @@ def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
         f"Last.fm: {json.dumps(lastfm, ensure_ascii=False)}\n"
     )
 
-def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
-    wiki = wiki or {}
-    lastfm = lastfm or {}
-    facts = facts or {}
-    return (
-        "СТРОГО ПО-РУССКИ. Никакого английского.\n"
-        "Сделай справку ОБ АЛЬБОМЕ.\n"
-        "Пиши только факты из данных ниже. Не выдумывай.\n"
-        "Формат 4–8 коротких строк, можно эмодзи.\n"
-        "Ссылки не добавляй.\n"
-        "Добавь строку: 🎛 Треков: N (если N есть во входных данных).\n\n"
-        f"MusicBrainz facts: {json.dumps(facts, ensure_ascii=False)}\n"
-        f"Wikipedia: {json.dumps(wiki, ensure_ascii=False)}\n"
-        f"Last.fm: {json.dumps(lastfm, ensure_ascii=False)}\n"
-    )
+
 def parse_ai_brief(text: str) -> dict:
     """Parse 4-line structured AI output.
     Preferred format:
@@ -731,20 +717,6 @@ def parse_ai_brief(text: str) -> dict:
 def render_ai_note(kind: str, info: dict, slim_facts: dict, ai_text: str) -> str:
     brief = parse_ai_brief(ai_text or "")
     track_count = (slim_facts or {}).get("track_count") if isinstance(slim_facts, dict) else None
-
-    if kind == "album":
-        body = (
-            f"<b>💿 Об альбоме</b>\n"
-            f"{html.escape(str(info.get('artist','')))} — {html.escape(str(info.get('album','')))}\n\n"
-            f"Коротко:\n"
-            f"• 🎭 <b>Идея</b> {html.escape(brief['idea'])}\n"
-            f"• 🎧 <b>Звук</b> {html.escape(brief['sound'])}\n"
-            f"• ✍️ <b>Темы</b> {html.escape(brief['themes'])}\n"
-            f"• 🧠 <b>Фишка</b> {html.escape(brief['feature'])}\n"
-        )
-        if isinstance(track_count, int) and track_count > 0:
-            body += f"\nТреков {track_count}"
-        return body
 
     body = (
         f"<b>👤 Об артисте</b>\n"
@@ -1472,7 +1444,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
         [InlineKeyboardButton(text="📈 Статистика+", callback_data="ui:stats_plus")],
-        [InlineKeyboardButton(text="🔁 На переслушать", callback_data="ui:relisten_menu")],
+        [InlineKeyboardButton(text="🔁 Переслушать", callback_data="ui:relisten_menu")],
         [InlineKeyboardButton(text="🔎 Поиск артиста", callback_data="ui:find_artist")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
