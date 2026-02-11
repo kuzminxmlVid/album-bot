@@ -654,49 +654,35 @@ def _ai_system_prompt_note() -> str:
     )
 
 def _ai_user_prompt_artist(facts: dict, wiki: dict, lastfm: dict) -> str:
+    wiki = wiki or {}
+    lastfm = lastfm or {}
+    facts = facts or {}
     return (
-        "Пиши по-русски. Никакого английского. "
-
-        "Сделай короткую справку об исполнителе. "
-        "Используй ТОЛЬКО факты из входных данных (Last.fm / Wikipedia / MusicBrainz). "
-        "Нельзя выдумывать. Нельзя добавлять ссылки. "
-        "Если данных нет — пиши 'нет данных'.\n\n"
-        "Верни СТРОГО 4 строки, без лишнего текста:\n"
-        "IDEA: ...\n"
-        "SOUND: ...\n"
-        "THEMES: ...\n"
-        "FEATURE: ...\n\n"
-        "ВХОДНЫЕ ДАННЫЕ (MusicBrainz JSON):\n"
-        f"{json.dumps(facts, ensure_ascii=False)}\n\n"
-        "ВХОДНЫЕ ДАННЫЕ (Wikipedia summary):\n"
-        f"title: {(wiki or {}).get('title')}\n"
-        f"extract: {(wiki or {}).get('extract')}\n\n"
-        "ВХОДНЫЕ ДАННЫЕ (Last.fm):\n"
-        f"{json.dumps(lastfm, ensure_ascii=False)}\n"
+        "СТРОГО ПО-РУССКИ. Никакого английского.\n"
+        "Сделай справку ОБ АРТИСТЕ.\n"
+        "Пиши только факты из данных ниже. Не выдумывай.\n"
+        "Формат 4–8 коротких строк, можно эмодзи.\n"
+        "Ссылки не добавляй.\n\n"
+        f"MusicBrainz facts: {json.dumps(facts, ensure_ascii=False)}\n"
+        f"Wikipedia: {json.dumps(wiki, ensure_ascii=False)}\n"
+        f"Last.fm: {json.dumps(lastfm, ensure_ascii=False)}\n"
     )
 
 def _ai_user_prompt_album(facts: dict, wiki: dict, lastfm: dict) -> str:
+    wiki = wiki or {}
+    lastfm = lastfm or {}
+    facts = facts or {}
     return (
-        "Пиши по-русски. Никакого английского. "
-
-        "Сделай короткую справку об альбоме. "
-        "Используй ТОЛЬКО факты из входных данных (Last.fm / Wikipedia / MusicBrainz). "
-        "Нельзя выдумывать. Нельзя добавлять ссылки, дату релиза, лейбл, тип релиза, треклист. "
-        "Если данных нет — пиши 'нет данных'.\n\n"
-        "Верни СТРОГО 4 строки, без лишнего текста:\n"
-        "IDEA: ...\n"
-        "SOUND: ...\n"
-        "THEMES: ...\n"
-        "FEATURE: ...\n\n"
-        "ВХОДНЫЕ ДАННЫЕ (MusicBrainz JSON):\n"
-        f"{json.dumps(facts, ensure_ascii=False)}\n\n"
-        "ВХОДНЫЕ ДАННЫЕ (Wikipedia summary):\n"
-        f"title: {(wiki or {}).get('title')}\n"
-        f"extract: {(wiki or {}).get('extract')}\n\n"
-        "ВХОДНЫЕ ДАННЫЕ (Last.fm):\n"
-        f"{json.dumps(lastfm, ensure_ascii=False)}\n"
+        "СТРОГО ПО-РУССКИ. Никакого английского.\n"
+        "Сделай справку ОБ АЛЬБОМЕ.\n"
+        "Пиши только факты из данных ниже. Не выдумывай.\n"
+        "Формат 4–8 коротких строк, можно эмодзи.\n"
+        "Ссылки не добавляй.\n"
+        "Добавь строку: 🎛 Треков: N (если N есть во входных данных).\n\n"
+        f"MusicBrainz facts: {json.dumps(facts, ensure_ascii=False)}\n"
+        f"Wikipedia: {json.dumps(wiki, ensure_ascii=False)}\n"
+        f"Last.fm: {json.dumps(lastfm, ensure_ascii=False)}\n"
     )
-
 def parse_ai_brief(text: str) -> dict:
     """Parse 4-line structured AI output.
     Preferred format:
