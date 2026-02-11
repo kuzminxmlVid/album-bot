@@ -7,7 +7,7 @@ import json
 import logging
 import html
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v59-2026-02-10_084957-9cd7b7d9")
+BOT_VERSION = os.getenv("BOT_VERSION", "v64-2026-02-10_084957-9cd7b7d9")
 AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
 from typing import Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
@@ -426,6 +426,19 @@ async def db_get_user_input(user_id: int) -> Optional[Dict]:
             user_id,
         )
         return dict(row) if row else None
+
+async def db_get_user_progress(user_id: int) -> dict:
+    """Совместимость: раньше код ожидал эту функцию. Возвращаем текущий список и индекс."""
+    try:
+        album_list = await get_selected_list(user_id)
+    except Exception:
+        album_list = "top100"
+    try:
+        idx = await get_index(user_id)
+    except Exception:
+        idx = 0
+    return {"album_list": album_list or "top100", "index": int(idx or 0)}
+
 
 async def db_clear_user_input(user_id: int) -> None:
     async with _pool().acquire() as conn:
@@ -2145,7 +2158,7 @@ async def cmd_find_artist(message: Message):
     # get active list
     active_list = None
     try:
-        prog = db_get_user_progress(user_id)
+        prog = await db_get_user_progress(user_id)
         if isinstance(prog, dict):
             active_list = prog.get("active_list") or prog.get("album_list") or prog.get("list")
     except Exception:
@@ -2245,6 +2258,29 @@ async def cmd_go(msg: Message):
         prefix=f"🎯 Переход к альбому #{rank}\nСписок: <b>{album_list}</b>",
     )
 
+
+
+
+@router.callback_query(F.data.startswith("go:"))
+async def cb_go(cb: CallbackQuery):
+    # callback_data: go:<album_list>:<rank>
+    try:
+        _, album_list, rank_s = cb.data.split(":", 2)
+        rank = int(rank_s)
+    except Exception:
+        await cb.answer("Некорректная кнопка", show_alert=False)
+        return
+
+    user_id = cb.from_user.id
+    idx = find_index_by_rank(album_list, rank)
+    if idx is None:
+        await cb.answer("Не нашёл в списке", show_alert=False)
+        return
+
+    await set_selected_list(user_id, album_list)
+    await set_index(user_id, idx)
+    await send_album_post(cb.message, album_list, idx, user_id=user_id)
+    await cb.answer()
 
 
 
@@ -2468,6 +2504,40 @@ async def ui_find_artist_cb(call: CallbackQuery):
         "Я покажу его позиции в текущем списке и дам кнопки GO.\n\n"
         "Отмена: /cancel",
     )
+
+
+@router.callback_query(F.data == "ui:favs")
+async def ui_favs(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    prog = await db_get_user_progress(user_id)
+    album_list = prog.get("album_list") or "top100"
+
+    favs = await list_favorites(user_id=user_id, album_list=album_list)
+    if not favs:
+        await cb.answer("Список пуст", show_alert=False)
+        await cb.message.answer("❤️ Любимые: пока пусто.", reply_markup=menu_keyboard())
+        return
+
+    df = get_albums(album_list)
+    lines = ["❤️ Любимые:"]
+    keyboard = []
+
+    for _album_list, rank in favs[:50]:
+        try:
+            row = df[df["rank"] == int(rank)].iloc[0].to_dict()
+            artist = str(row.get("artist", "")).strip()
+            album = str(row.get("album", "")).strip()
+        except Exception:
+            artist = ""
+            album = ""
+        title = f"{int(rank)}. {artist} — {album}".strip(" —")
+        lines.append(title)
+        keyboard.append([InlineKeyboardButton(text=f"GO {int(rank)}", callback_data=f"go:{album_list}:{int(rank)}")])
+
+    keyboard.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="ui:menu")])
+
+    await cb.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await cb.answer()
 
 
 @router.callback_query(F.data == "ui:stats")
