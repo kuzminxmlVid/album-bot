@@ -1505,7 +1505,6 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏮ Предыдущий", callback_data="nav:prev")],
         [InlineKeyboardButton(text="🧭 Перейти (go)", callback_data="ui:go")],
         [InlineKeyboardButton(text="❤️ Любимые", callback_data="ui:favs")],
-        [InlineKeyboardButton(text="🎲 Случайный любимый", callback_data="ui:rand_fav")],
         [InlineKeyboardButton(text="⭐️ Рейтинг", callback_data="ui:rate_menu")],
         [InlineKeyboardButton(text="🔁 Переслушивание", callback_data="ui:relisten_menu")],
         [InlineKeyboardButton(text="🔎 Поиск артиста", callback_data="ui:find_artist")],
@@ -2116,7 +2115,7 @@ async def perform_find_artist(user_id: int, needle: str) -> dict:
         return {"text": "Введите имя артиста.", "kb": None}
 
     album_list = await get_selected_list(user_id)
-    df = await get_albums(album_list)
+    df = get_albums(album_list)
 
     if df is None or df.empty or "artist" not in df.columns:
         return {"text": "Список пуст или не загружен.", "kb": None}
@@ -2275,28 +2274,31 @@ async def cmd_go(msg: Message):
 
 
 @router.callback_query(F.data.startswith("go:"))
-async def cb_go(cb: CallbackQuery):
-    # callback_data: go:<album_list>:<rank>
+async def go_cb(call: CallbackQuery):
+    await call.answer()
+    user_id = call.from_user.id
+
     try:
-        _, album_list, rank_s = cb.data.split(":", 2)
+        _, album_list, rank_s = (call.data or "").split(":", 2)
         rank = int(rank_s)
     except Exception:
-        await cb.answer("Некорректная кнопка", show_alert=False)
+        await call.message.answer("Не понял, куда идти. Попробуй ещё раз.")
         return
 
-    user_id = cb.from_user.id
-    idx = find_index_by_rank(album_list, rank)
-    if idx is None:
-        await cb.answer("Не нашёл в списке", show_alert=False)
+    df = get_albums(album_list)
+    if df is None or df.empty:
+        await call.message.answer("В этом списке нет альбомов.")
         return
 
-    await set_selected_list(user_id, album_list)
-    await set_index(user_id, idx)
-    await send_album_post(cb.message, album_list, idx, user_id=user_id)
-    await cb.answer()
+    # rank — это место (1..N)
+    hits = df.index[df["rank"] == rank].tolist() if "rank" in df.columns else []
+    if hits:
+        idx = int(hits[0])
+    else:
+        idx = max(0, min(rank - 1, len(df) - 1))
 
-
-
+    await set_index(user_id, album_list, idx)
+    await send_album_post(user_id, album_list, idx)
 @router.message(F.text & ~F.text.startswith("/"))
 async def pending_text_handler(message: Message):
     ui = await db_get_user_input(message.from_user.id)
@@ -2464,39 +2466,74 @@ async def cb_noop(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("nav:"))
 async def nav_cb(call: CallbackQuery):
-    user_id = call.from_user.id
-    album_list = await ensure_user(user_id)
-    idx = await get_index(user_id, album_list)
-    action = call.data.split(":", 1)[1]
-
-    if action == "next":
-        await set_index(user_id, album_list, idx - 1)
-        await call.answer()
-        await send_album_post(user_id, album_list, idx - 1, ctx="flow")
-        return
-
-    if action == "prev":
-        await set_index(user_id, album_list, idx + 1)
-        await call.answer()
-        await send_album_post(user_id, album_list, idx + 1, ctx="flow")
-        return
-
-    if action == "reset":
-        albums = get_albums(album_list)
-        new_idx = len(albums) - 1
-        await set_index(user_id, album_list, new_idx)
-        await call.answer("Сброшено")
-        await send_album_post(user_id, album_list, new_idx, ctx="flow")
-        return
-
     await call.answer()
+    user_id = call.from_user.id
 
+    parts = (call.data or "").split(":")
+    if len(parts) < 2:
+        return
+    direction = parts[1]  # prev / next
+
+    album_list = await get_selected_list(user_id)
+    df = get_albums(album_list)
+    if df is None or df.empty:
+        await call.message.answer("В этом списке нет альбомов.")
+        return
+
+    cur = await get_index(user_id, album_list)
+    cur = int(cur) if cur is not None else 0
+    cur = max(0, min(cur, len(df) - 1))
+
+    if direction == "next":
+        new_idx = cur - 1
+    else:
+        new_idx = cur + 1
+
+    if new_idx < 0:
+        new_idx = len(df) - 1
+    if new_idx >= len(df):
+        new_idx = 0
+
+    await set_index(user_id, album_list, new_idx)
+    await send_album_post(user_id, album_list, new_idx)
 @router.callback_query(F.data == "ui:menu")
 async def menu_cb(call: CallbackQuery):
     await call.answer()
     await call.message.answer("📋 Меню", reply_markup=menu_keyboard())
 
+@router.callback_query(F.data == "ui:rate_menu")
+async def ui_rate_menu_cb(cb: CallbackQuery):
+    await cb.answer()
+    user_id = cb.from_user.id
 
+    album_list = await get_selected_list(user_id)
+    df = get_albums(album_list)
+    if df is None or df.empty:
+        await cb.message.edit_text("В этом списке нет альбомов.", reply_markup=main_menu_kb())
+        return
+
+    idx = await get_index(user_id, album_list)
+    idx = int(idx) if idx is not None else 0
+    idx = max(0, min(idx, len(df) - 1))
+    row = df.iloc[idx]
+
+    rank = int(row.get("rank", idx + 1))
+    title = str(row.get("album", "") or row.get("title", "") or "Без названия").strip()
+    artist = str(row.get("artist", "") or "Неизвестный артист").strip()
+
+    text = (
+        "⭐️ Рейтинг\n\n"
+        f"Текущий: {rank}. {artist} — {title}\n\n"
+        "Что делаем?"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐️ Оценить текущий", callback_data=f"ui:rate:{album_list}:{rank}:menu")],
+        [InlineKeyboardButton(text="🏆 Топ", callback_data=f"ui:top:{album_list}")],
+        [InlineKeyboardButton(text="👎 Анти-топ", callback_data=f"ui:bottom:{album_list}")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="ui:menu")],
+    ])
+    await cb.message.edit_text(text, reply_markup=kb)
 @router.callback_query(F.data == "ui:find_artist")
 async def ui_find_artist_cb(call: CallbackQuery):
     await call.answer()
@@ -2509,63 +2546,41 @@ async def ui_find_artist_cb(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "ui:favs")
-async def ui_favs(cb: CallbackQuery):
+@router.callback_query(F.data == "ui:favs")
+async def ui_favs_cb(cb: CallbackQuery):
+    await cb.answer()
     user_id = cb.from_user.id
-    favs = await list_favorites(user_id, limit=50)
 
+    favs = await list_favorites(user_id)
     if not favs:
-        await cb.message.answer("❤️ Любимых альбомов пока нет.", reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="ui:menu")]]
-        ))
-        await cb.answer()
+        await cb.message.edit_text(
+            "❤️ Любимые пустые.\n\n"
+            "Чтобы добавить альбом в любимые — открой альбом и нажми «❤️ В любимые».",
+            reply_markup=main_menu_kb(),
+        )
         return
 
-    lines = ["❤️ Любимые альбомы (последние 50)", ""]
-    buttons: list[list[InlineKeyboardButton]] = []
+    # list_favorites -> List[Tuple[list_name, rank]]
+    favs = favs[:25]
 
-    # show with GO buttons
-    for album_list, rank in favs[:12]:
-        df = await get_albums(album_list)
-        row = df[df["rank"] == rank].head(1) if df is not None and not df.empty else None
-        if row is not None and not row.empty:
-            artist = str(row.iloc[0].get("artist", "") or "")
-            album = str(row.iloc[0].get("album", "") or "")
-            lines.append(f"• {album_list} — #{rank}: {artist} — {album}")
-        else:
-            lines.append(f"• {album_list} — #{rank}")
+    rows = []
+    buttons = []
+    for n, (album_list, rank) in enumerate(favs, 1):
+        df = get_albums(album_list)
+        title = "Без названия"
+        artist = "Неизвестный артист"
+        if df is not None and not df.empty and "rank" in df.columns:
+            hit = df[df["rank"] == int(rank)]
+            if not hit.empty:
+                r = hit.iloc[0]
+                title = str(r.get("album", "") or r.get("title", "") or title).strip()
+                artist = str(r.get("artist", "") or artist).strip()
 
-        buttons.append([InlineKeyboardButton(text=f"GO #{rank}", callback_data=f"go:{album_list}:{rank}")])
+        rows.append(f"{n}. {artist} — {title} ({album_list} #{rank})")
+        buttons.append([InlineKeyboardButton(text=f"▶️ {n}", callback_data=f"go:{album_list}:{int(rank)}")])
 
-    buttons.append([InlineKeyboardButton(text="🎲 Случайный любимый", callback_data="ui:rand_fav")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="ui:menu")])
-
-    await cb.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await cb.answer()
-
-@router.callback_query(F.data == "ui:rand_fav")
-async def ui_rand_fav(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    favs = await list_favorites(user_id, limit=500)
-    if not favs:
-        await cb.message.answer("❤️ Любимых альбомов пока нет.", reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="ui:menu")]]
-        ))
-        await cb.answer()
-        return
-
-    album_list, rank = random.choice(favs)
-    df = await get_albums(album_list)
-    idx = find_index_by_rank(df, rank) if df is not None else 0
-
-    await set_selected_list(user_id, album_list)
-    await set_index(user_id, album_list, idx)
-
-    await send_album_post(user_id, album_list, idx, prefix="🎲 Случайный любимый")
-    await cb.answer()
-
-
-
-@router.callback_query(F.data == "ui:stats")
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons + [[InlineKeyboardButton(text="⬅️ В меню", callback_data="ui:menu")]])
+    await cb.message.edit_text("❤️ Любимые\n\n" + "\n".join(rows), reply_markup=kb)
 async def stats_cb(call: CallbackQuery):
     txt = await build_stats_text(call.from_user.id)
     await call.answer()
@@ -2738,30 +2753,43 @@ async def rate_ui(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("rate:"))
 async def rate_set(call: CallbackQuery):
-    parts = call.data.split(":")
-    if len(parts) != 5:
-        await call.answer("Ошибка кнопки", show_alert=True)
+    # отвечаем сразу, чтобы не было "кнопка устарела"
+    await call.answer()
+    user_id = call.from_user.id
+
+    parts = (call.data or "").split(":")
+    if len(parts) < 4:
+        return
+    _, value_s, album_list, rank_s = parts[:4]
+
+    try:
+        value = int(value_s)
+        rank = int(rank_s)
+    except Exception:
         return
 
-    rating = int(parts[1])
-    album_list = canonical_list_name(parts[2])
-    album_list = resolve_list_name(album_list) or album_list
-    rank = int(parts[3])
-    ctx = parts[4]
+    if value < 0 or value > 5:
+        return
 
-    await upsert_rating(call.from_user.id, album_list, rank, rating)
-    await call.answer(f"⭐ {rating} сохранено")
+    await upsert_rating(user_id, album_list, rank, value)
+    await edit_album_post(call, album_list, rank, prefix="👍" if value >= 4 else ("👎" if 0 < value <= 2 else ""))
 
-    await edit_album_post(call, album_list, rank, ctx)
+    # если после оценки хочется листать дальше — листаем
+    df = get_albums(album_list)
+    if df is None or df.empty or "rank" not in df.columns:
+        return
 
-    # Only auto-advance in main flow
-    if ctx == "flow":
-        idx = await get_index(call.from_user.id, album_list)
-        albums = get_albums(album_list)
-        if 0 <= idx < len(albums) and int(albums.iloc[idx]["rank"]) == rank:
-            await set_index(call.from_user.id, album_list, idx - 1)
-            await send_album_post(call.from_user.id, album_list, idx - 1, ctx="flow")
+    idx = df.index[df["rank"] == rank].tolist()
+    if not idx:
+        return
 
+    cur = int(idx[0])
+    nxt = cur - 1
+    if nxt < 0:
+        nxt = len(df) - 1
+
+    await set_index(user_id, album_list, nxt)
+    await send_album_post(user_id, album_list, nxt)
 @router.callback_query(F.data.startswith("ui:back:"))
 async def back(call: CallbackQuery):
     parts = call.data.split(":")
@@ -2936,17 +2964,6 @@ async def cmd_favorites(message: Message):
             lines.append(f"{lst} #{rk}")
     await message.answer("\n".join(lines))
 
-@router.message(Command("rand_favorite"))
-async def cmd_rand_favorite(message: Message):
-    item = await random_favorite(message.from_user.id)
-    if not item:
-        await message.answer("Любимых альбомов пока нет.")
-        return
-    lst, rk = item
-    await set_selected_list(message.from_user.id, lst)
-    await set_progress(message.from_user.id, lst, rk)
-    await send_album_post(message.from_user.id, lst)
-
 @router.message(Command("version"))
 async def cmd_version(msg: Message):
     await msg.answer(f"Версия бота: {BOT_VERSION}")
@@ -3117,7 +3134,7 @@ async def fav_toggle(cb: CallbackQuery):
     new_state = await toggle_favorite(user_id, album_list, rank)
 
     # Rebuild keyboard for the same album card
-    df = await get_albums(album_list)
+    df = get_albums(album_list)
     if df is not None and not df.empty:
         row = df[df["rank"] == rank].head(1)
         if not row.empty:
