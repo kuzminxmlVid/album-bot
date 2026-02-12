@@ -1740,7 +1740,81 @@ async def export_ratings_csv(user_id: int) -> bytes:
     for r in rows:
         w.writerow([r["album_list"], r["rank"], r["rating"], r["rated_at"].isoformat()])
     return buf.getvalue().encode("utf-8")
-    
+
+# ================= DAILY ALBUM =================
+
+async def toggle_daily(user_id: int) -> bool:
+    album_list = await get_selected_list(user_id)
+    tz = Config.DAILY_TZ
+    h, m = Config.DAILY_HOUR, Config.DAILY_MINUTE
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT is_enabled FROM daily_subscriptions WHERE user_id=$1", user_id)
+        if not row:
+            await conn.execute(
+                """
+                INSERT INTO daily_subscriptions (user_id, is_enabled, album_list, send_hour, send_minute, tz, last_sent)
+                VALUES ($1, TRUE, $2, $3, $4, $5, NULL)
+                """,
+                user_id, album_list, h, m, tz
+            )
+            return True
+        new_state = not bool(row["is_enabled"])
+        await conn.execute(
+            "UPDATE daily_subscriptions SET is_enabled=$1, album_list=$2, send_hour=$3, send_minute=$4, tz=$5 WHERE user_id=$6",
+            new_state, album_list, h, m, tz, user_id
+        )
+        return new_state
+
+def daily_pick_index(list_name: str, for_date: date, user_id: int) -> int:
+    albums = get_albums(list_name)
+    if len(albums) == 0:
+        return -1
+    days = (for_date - date(2020, 1, 1)).days
+    # user-specific salt keeps it stable and different across users
+    salt = (user_id * 2654435761) & 0xFFFFFFFF
+    offset = (days + salt) % len(albums)
+    return (len(albums) - 1) - offset
+
+async def send_daily_album_to(user_id: int, list_name: str, today: date) -> None:
+    idx = daily_pick_index(list_name, today, user_id)
+    prefix = f"☀️ <b>Альбом дня</b> ({today.isoformat()})\nСписок: <b>{list_name}</b>"
+    await send_album_post(user_id, list_name, idx, ctx="daily", prefix=prefix)
+
+async def daily_loop() -> None:
+    tz = ZoneInfo(Config.DAILY_TZ)
+    while True:
+        try:
+            now = datetime.now(tz)
+            today = now.date()
+
+            if now.hour == Config.DAILY_HOUR and now.minute == Config.DAILY_MINUTE:
+                async with _pool().acquire() as conn:
+                    subs = await conn.fetch(
+                        "SELECT user_id, album_list, last_sent FROM daily_subscriptions WHERE is_enabled=TRUE"
+                    )
+                for s in subs:
+                    user_id = int(s["user_id"])
+                    list_name = s["album_list"]
+                    if s["last_sent"] == today:
+                        continue
+                    try:
+                        await send_daily_album_to(user_id, list_name, today)
+                        async with _pool().acquire() as conn:
+                            await conn.execute(
+                                "UPDATE daily_subscriptions SET last_sent=$1 WHERE user_id=$2",
+                                today, user_id
+                            )
+                    except Exception as e:
+                        log.warning("daily send failed user=%s: %s", user_id, e)
+
+            nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            await asyncio.sleep(max(1.0, (nxt - datetime.now(tz)).total_seconds()))
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("daily loop crashed")
+            await asyncio.sleep(5)
+
 # ================= ERROR HANDLER =================
 
 @router.errors()
@@ -2423,7 +2497,7 @@ def favorites_keyboard() -> InlineKeyboardMarkup:
 async def ui_favorites_cb(call: CallbackQuery):
     await call.answer()
     await call.message.answer(
-        "❤️ <b>Любимые</b>\n\n"
+        "❤️ Любимые\n\n"
         "Тут твои отмеченные альбомы.\n"
         "Rank можно открыть командой /go 77.",
         reply_markup=favorites_keyboard()
@@ -2451,16 +2525,21 @@ async def ui_favorites_list_cb(call: CallbackQuery):
         await call.message.answer("❤️ Любимых пока нет.")
         return
 
-    lines = ["❤️ <b>Любимые</b> (последние добавленные)\n",
-             "Rank можно открыть командой /go 77.\n"]
-    for i, (lst, rank) in enumerate(rows, 1):
+    lines = [
+        "❤️ Любимые (последние добавленные)\n",
+        "Rank можно открыть командой /go 77.\n",
+    ]
+
+    for (lst, rank) in rows:
         info = await _album_by_rank(lst, rank)
         if info:
-            lines.append(f"{i}. <b>{rank}</b>. {html.escape(info['artist'])} — {html.escape(info['album'])} <i>({html.escape(lst)})")
+            artist = (info.get("artist") or "").replace("\n", " ").strip()
+            album = (info.get("album") or "").replace("\n", " ").strip()
+            lines.append(f"• {rank} — {artist}, {album}. {lst}")
         else:
-            lines.append(f"{i}. <b>{rank}</b>. <i>({html.escape(lst)})")
-    await call.message.answer("\n".join(lines), reply_markup=favorites_keyboard(), disable_web_page_preview=True)
+            lines.append(f"• {rank}. {lst}")
 
+    await call.message.answer("\n".join(lines), reply_markup=favorites_keyboard(), disable_web_page_preview=True)
 
 @router.callback_query(F.data == "ui:stats")
 async def stats_cb(call: CallbackQuery):
