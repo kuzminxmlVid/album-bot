@@ -1465,7 +1465,7 @@ def build_go_markup(active_list: str, ranks: list[int], include_menu: bool = Tru
     for r in ranks:
         buttons.append(InlineKeyboardButton(text=f"GO {r}", callback_data=f"go:{encode_list_name(active_list)}:{r}"))
     if include_menu:
-        buttons.append(InlineKeyboardButton(text="Меню", callback_data="menu"))
+        buttons.append(InlineKeyboardButton(text="Меню", callback_data="ui:menu"))
     # chunk into rows
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(buttons), per_row):
@@ -2469,6 +2469,7 @@ async def nav_cb(call: CallbackQuery):
 
     await call.answer()
 
+@router.callback_query(F.data == "menu")
 @router.callback_query(F.data == "ui:menu")
 async def menu_cb(call: CallbackQuery):
     await call.answer()
