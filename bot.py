@@ -1475,6 +1475,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
         [InlineKeyboardButton(text="📈 Статистика+", callback_data="ui:stats_plus")],
         [InlineKeyboardButton(text="🔁 Переслушать", callback_data="ui:relisten_menu")],
+        [InlineKeyboardButton(text="❤️ Любимые", callback_data="ui:favorites")],
         [InlineKeyboardButton(text="🔎 Поиск артиста", callback_data="ui:find_artist")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
@@ -2482,6 +2483,57 @@ async def ui_find_artist_cb(call: CallbackQuery):
         "Я покажу его позиции в текущем списке rank можно открыть командой /go 77.\n\n"
         "Отмена: /cancel",
     )
+
+
+
+def favorites_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Рандом", callback_data="ui:favorites_random")],
+        [InlineKeyboardButton(text="📜 Список", callback_data="ui:favorites_list")],
+        [InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")],
+    ])
+
+@router.callback_query(F.data == "ui:favorites")
+async def ui_favorites_cb(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "❤️ <b>Любимые</b>\n\n"
+        "Тут твои отмеченные альбомы.\n"
+        "Rank можно открыть командой /go 77.",
+        reply_markup=favorites_keyboard()
+    )
+
+@router.callback_query(F.data == "ui:favorites_random")
+async def ui_favorites_random_cb(call: CallbackQuery):
+    await call.answer()
+    pick = await random_favorite(call.from_user.id)
+    if not pick:
+        await call.message.answer("❤️ Любимых пока нет.")
+        return
+    album_list, rank = pick
+    idx = find_index_by_rank(album_list, rank)
+    if idx is None:
+        await call.message.answer("Не смог найти этот альбом в списке. Возможно список обновился.")
+        return
+    await send_album_post(call.from_user.id, album_list, idx, ctx="flow")
+
+@router.callback_query(F.data == "ui:favorites_list")
+async def ui_favorites_list_cb(call: CallbackQuery):
+    await call.answer()
+    rows = await list_favorites(call.from_user.id, limit=80)
+    if not rows:
+        await call.message.answer("❤️ Любимых пока нет.")
+        return
+
+    lines = ["❤️ <b>Любимые</b> (последние добавленные)\n",
+             "Rank можно открыть командой /go 77.\n"]
+    for i, (lst, rank) in enumerate(rows, 1):
+        info = await _album_by_rank(lst, rank)
+        if info:
+            lines.append(f"{i}. <b>{rank}</b>. {html.escape(info['artist'])} — {html.escape(info['album'])} <i>({html.escape(lst)})</i>")
+        else:
+            lines.append(f"{i}. <b>{rank}</b>. <i>({html.escape(lst)})</i>")
+    await call.message.answer("\n".join(lines), reply_markup=favorites_keyboard(), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "ui:stats")
