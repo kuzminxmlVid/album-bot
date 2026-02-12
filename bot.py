@@ -288,6 +288,10 @@ def canonical_list_name(name: str) -> str:
 def encode_list_name(name: str) -> str:
     return quote(canonical_list_name(name), safe="")
 
+def decode_list_name(enc: str) -> str:
+    return unquote(enc)
+
+
 
 
 def get_list_intro(list_name: str) -> Optional[str]:
