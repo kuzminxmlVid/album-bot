@@ -1460,17 +1460,14 @@ def rating_keyboard(album_list: str, rank: int, ctx: str) -> InlineKeyboardMarku
 
 
 def build_go_markup(active_list: str, ranks: list[int], include_menu: bool = True, per_row: int = 2) -> InlineKeyboardMarkup:
-    """Build inline keyboard with GO buttons without InlineKeyboardBuilder (avoids NameError if import missing)."""
-    buttons: list[InlineKeyboardButton] = []
-    for r in ranks:
-        buttons.append(InlineKeyboardButton(text=f"GO {r}", callback_data=f"go:{encode_list_name(active_list)}:{r}"))
+    """Build inline keyboard for search results.
+
+    По просьбе: убрали кнопки GO. Оставляем только кнопку «Меню».
+    Переход делается вручную командой /go <rank>.
+    """
     if include_menu:
-        buttons.append(InlineKeyboardButton(text="Меню", callback_data="ui:menu"))
-    # chunk into rows
-    rows: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(buttons), per_row):
-        rows.append(buttons[i:i+per_row])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Меню", callback_data="ui:menu")]])
+    return InlineKeyboardMarkup(inline_keyboard=[])
 
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -2482,7 +2479,7 @@ async def ui_find_artist_cb(call: CallbackQuery):
     await db_set_user_input(call.from_user.id, "find_artist", None)
     await call.message.answer(
         "🔎 Напиши имя артиста одним сообщением.\n"
-        "Я покажу его позиции в текущем списке и дам кнопки GO.\n\n"
+        "Я покажу его позиции в текущем списке rank можно открыть командой /go 77.\n\n"
         "Отмена: /cancel",
     )
 
@@ -2606,49 +2603,23 @@ async def setlist_cb(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("go"))
 async def go_cb(call: CallbackQuery):
-    """Jump to a specific rank.
+    """GO-кнопка отключена.
 
-    Supports callback_data formats:
-      - go:<rank>
-      - go:<list>:<rank>
+    Раньше после поиска давали GO-кнопки, но они постоянно ломались из-за разных форматов callback_data.
+    Теперь переход делается вручную командой: /go <rank>.
     """
     data = (call.data or "").strip()
-    parts = data.split(":")
+    # Пытаемся вытащить rank для подсказки
+    rank_hint = None
     try:
-        if len(parts) < 2:
-            raise ValueError("too few parts")
-
-        rank_s = parts[-1]
-        try:
-            rank = int(rank_s)
-        except Exception as e:
-            raise ValueError(f"bad rank '{rank_s}'") from e
-
-        if len(parts) >= 3 and parts[1]:
-            album_list_raw = decode_list_name(parts[1])
-            resolved = resolve_list_name(album_list_raw) or album_list_raw
-        else:
-            resolved = await get_selected_list(call.from_user.id)
-            if not resolved:
-                resolved = get_default_list_name()
+        parts = data.split(":")
+        if parts:
+            rank_hint = int(parts[-1])
     except Exception:
-        log.warning("go_cb: cannot parse callback data=%r", data)
-        await call.answer("Не понял куда прыгать", show_alert=True)
-        return
+        rank_hint = None
 
-    try:
-        idx = find_index_by_rank(resolved, rank)
-        if idx is None:
-            await call.answer("Такого rank нет в списке", show_alert=True)
-            return
-
-        await set_selected_list(call.from_user.id, resolved)
-        await set_index(call.from_user.id, resolved, idx)
-        await send_album_post(call.from_user.id, resolved, idx, ctx="go")
-        await call.answer()
-    except Exception as e:
-        log.exception("go_cb failed (data=%r)", data)
-        await call.answer(f"Ошибка: {e}", show_alert=True)
+    hint = f"Используй /go {rank_hint}" if rank_hint else "Используй /go <rank>"
+    await call.answer(f"Переход по кнопке отключён. {hint}", show_alert=True)
 
 @router.callback_query(F.data == "ui:daily")
 async def ui_daily(call: CallbackQuery):
