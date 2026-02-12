@@ -2604,14 +2604,35 @@ async def setlist_cb(call: CallbackQuery):
     await send_album_post(call.from_user.id, resolved, idx, ctx="flow")
 
 
-@router.callback_query(F.data.startswith("go:"))
+@router.callback_query(F.data.startswith("go"))
 async def go_cb(call: CallbackQuery):
+    """Jump to a specific rank.
+
+    Supports callback_data formats:
+      - go:<rank>
+      - go:<list>:<rank>
+    """
+    data = (call.data or "").strip()
+    parts = data.split(":")
     try:
-        _, enc_list, rank_s = (call.data or "").split(":", 2)
-        album_list = decode_list_name(enc_list)
-        resolved = resolve_list_name(album_list) or album_list
-        rank = int(rank_s)
+        if len(parts) < 2:
+            raise ValueError("too few parts")
+
+        rank_s = parts[-1]
+        try:
+            rank = int(rank_s)
+        except Exception as e:
+            raise ValueError(f"bad rank '{rank_s}'") from e
+
+        if len(parts) >= 3 and parts[1]:
+            album_list_raw = decode_list_name(parts[1])
+            resolved = resolve_list_name(album_list_raw) or album_list_raw
+        else:
+            resolved = await get_selected_list(call.from_user.id)
+            if not resolved:
+                resolved = get_default_list_name()
     except Exception:
+        log.warning("go_cb: cannot parse callback data=%r", data)
         await call.answer("Не понял куда прыгать", show_alert=True)
         return
 
@@ -2621,13 +2642,12 @@ async def go_cb(call: CallbackQuery):
             await call.answer("Такого rank нет в списке", show_alert=True)
             return
 
-        # ensure selected list matches jump target
         await set_selected_list(call.from_user.id, resolved)
         await set_index(call.from_user.id, resolved, idx)
         await send_album_post(call.from_user.id, resolved, idx, ctx="go")
         await call.answer()
     except Exception as e:
-        log.exception("go_cb failed")
+        log.exception("go_cb failed (data=%r)", data)
         await call.answer(f"Ошибка: {e}", show_alert=True)
 
 @router.callback_query(F.data == "ui:daily")
