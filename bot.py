@@ -28,7 +28,6 @@ from aiogram.types import (
     BufferedInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
-
 # ================= LOGGING =================
 
 logging.basicConfig(
@@ -1455,6 +1454,20 @@ def rating_keyboard(album_list: str, rank: int, ctx: str) -> InlineKeyboardMarku
         [InlineKeyboardButton(text="⬅️ Назад к посту", callback_data=f"ui:back:{enc}:{rank}:{ctx}")],
     ])
 
+
+def build_go_markup(active_list: str, ranks: list[int], include_menu: bool = True, per_row: int = 2) -> InlineKeyboardMarkup:
+    """Build inline keyboard with GO buttons without InlineKeyboardBuilder (avoids NameError if import missing)."""
+    buttons: list[InlineKeyboardButton] = []
+    for r in ranks:
+        buttons.append(InlineKeyboardButton(text=f"GO {r}", callback_data=f"go:{encode_list_name(active_list)}:{r}"))
+    if include_menu:
+        buttons.append(InlineKeyboardButton(text="Меню", callback_data="menu"))
+    # chunk into rows
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(buttons), per_row):
+        rows.append(buttons[i:i+per_row])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
@@ -2113,16 +2126,14 @@ async def perform_find_artist(user_id: int, needle: str) -> Dict[str, Any]:
         else:
             lines_out.append(f"{a} — {al}{y_txt}")
 
-    kb = InlineKeyboardBuilder()
+    ranks = []
     for m in matches[:10]:
         r = m.get("rank")
-        if r is None:
-            continue
-        kb.button(text=f"GO {r}", callback_data=f"go:{encode_list_name(active_list)}:{r}")
-    kb.button(text="Меню", callback_data="menu")
-    kb.adjust(2)
+        if isinstance(r, int):
+            ranks.append(r)
+    kb_markup = build_go_markup(active_list, ranks, include_menu=True, per_row=2)
 
-    return {"active_list": active_list, "matches": matches, "text": "\n".join(lines_out), "kb": kb.as_markup()}
+    return {"active_list": active_list, "matches": matches, "text": "\n".join(lines_out), "kb": kb_markup}
 @router.message(Command("find_artist"))
 async def cmd_find_artist(message: Message):
     """
@@ -2187,14 +2198,15 @@ async def cmd_find_artist(message: Message):
     matches.sort(key=lambda x: (x[0] if isinstance(x[0], int) else 10**9, x[1]))
     matches = matches[:10]
 
-    kb = InlineKeyboardBuilder()
+    ranks = []
     lines = [f"Нашёл в списке <b>{html.escape(str(active_list))}</b>:"]
     for rank, artist, album in matches:
         lines.append(f"{rank}. {artist} — {album}")
-        kb.button(text=f"GO {rank}", callback_data=f"go:{active_list}:{rank}")
-    kb.adjust(5)
+        if isinstance(rank, int):
+            ranks.append(rank)
+    kb_markup = build_go_markup(active_list, ranks, include_menu=True, per_row=5)
 
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb.as_markup())
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_markup)
 
 
 async def cmd_go(msg: Message):
