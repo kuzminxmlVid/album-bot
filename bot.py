@@ -2456,9 +2456,9 @@ async def ui_favorites_list_cb(call: CallbackQuery):
     for i, (lst, rank) in enumerate(rows, 1):
         info = await _album_by_rank(lst, rank)
         if info:
-            lines.append(f"{i}. <b>{rank}</b>. {html.escape(info['artist'])} — {html.escape(info['album'])} <i>({html.escape(lst)})</i>")
+            lines.append(f"{i}. <b>{rank}</b>. {html.escape(info['artist'])} — {html.escape(info['album'])} <i>({html.escape(lst)})")
         else:
-            lines.append(f"{i}. <b>{rank}</b>. <i>({html.escape(lst)})</i>")
+            lines.append(f"{i}. <b>{rank}</b>. <i>({html.escape(lst)})")
     await call.message.answer("\n".join(lines), reply_markup=favorites_keyboard(), disable_web_page_preview=True)
 
 
