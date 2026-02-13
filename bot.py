@@ -2107,10 +2107,6 @@ async def cmd_next_from(msg: Message):
     )
     await set_index(user_id, resolved, idx - 1)
 
-@router.message(Command("go"))
-
-
-
 
 async def perform_find_artist(user_id: int, needle: str) -> Dict[str, Any]:
     """Search artist within the currently selected list and return GO buttons."""
@@ -2241,6 +2237,7 @@ async def cmd_find_artist(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_markup)
 
 
+@router.message(Command("go"))
 async def cmd_go(msg: Message):
     """
     Переход к конкретному альбому по ранку.
