@@ -264,7 +264,24 @@ async def init_pg() -> None:
         """)
 
 
-        # daily subscription
+        
+        # per-user short reviews for albums
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_reviews (
+            user_id BIGINT NOT NULL,
+            album_list TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            review TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, album_list, rank)
+        )
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_reviews_user
+        ON user_reviews (user_id, updated_at DESC)
+        """)
+
+# daily subscription
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_subscriptions (
             user_id BIGINT PRIMARY KEY,
@@ -1307,6 +1324,54 @@ async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -
         )
 
 
+
+# ================= USER REVIEWS (per-user короткий отзыв) =================
+
+REVIEW_MAX_LEN = 240  # hard limit for stored review
+
+def _normalize_review(text: str) -> str:
+    s = (text or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    if len(s) > REVIEW_MAX_LEN:
+        s = s[:REVIEW_MAX_LEN].rstrip()
+    return s
+
+async def get_user_review(user_id: int, album_list: str, rank: int) -> Optional[str]:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT review FROM user_reviews WHERE user_id=$1 AND album_list=$2 AND rank=$3",
+            int(user_id), album_list, int(rank)
+        )
+        return str(row["review"]) if row else None
+
+async def upsert_user_review(user_id: int, album_list: str, rank: int, review: str) -> None:
+    review_n = _normalize_review(review)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_reviews (user_id, album_list, rank, review, updated_at)
+            VALUES ($1,$2,$3,$4,NOW())
+            ON CONFLICT (user_id, album_list, rank)
+            DO UPDATE SET review=EXCLUDED.review, updated_at=NOW()
+            """,
+            int(user_id), album_list, int(rank), review_n
+        )
+
+async def delete_user_review(user_id: int, album_list: str, rank: int) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM user_reviews WHERE user_id=$1 AND album_list=$2 AND rank=$3",
+            int(user_id), album_list, int(rank)
+        )
+
+def _review_line_for_caption(review: Optional[str]) -> str:
+    if not review:
+        return ""
+    s = review.strip()
+    if len(s) > 180:
+        s = s[:180].rstrip() + "…"
+    return f"\n\n💬 <b>Ваш отзыв:</b> {html.escape(s)}"
+
 # ================= RELISTEN ("Переслушаю") =================
 
 async def is_relisten(user_id: int, album_list: str, rank: int) -> bool:
@@ -1446,9 +1511,10 @@ async def send_random_relisten(user_id: int) -> None:
 def google_link(artist: str, album: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
-def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: Optional[int], *, in_relisten: bool = False, prefix: str = "") -> str:
+def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: Optional[int], *, in_relisten: bool = False, prefix: str = "", review: Optional[str] = None) -> str:
     rating_line = f"\n\n⭐ <b>Ваша оценка:</b> {user_rating}/5" if user_rating else ""
     relisten_line = "\n🔁 <b>Переслушаю:</b> да" if in_relisten else ""
+    review_line = _review_line_for_caption(review)
     header = (prefix + "\n\n") if prefix else ""
     return (
         header +
@@ -1458,6 +1524,7 @@ def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: O
         f"🎧 {genre}"
         f"{rating_line}"
         f"{relisten_line}"
+        f"{review_line}"
     )
 
 def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, listen_url: Optional[str], *, in_relisten: bool = False, is_fav: bool = False) -> InlineKeyboardMarkup:
@@ -1475,6 +1542,7 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
         [
             InlineKeyboardButton(text=rate_text, callback_data=f"ui:rate:{enc}:{rank}:{ctx}"),
             InlineKeyboardButton(text=rel_text, callback_data=f"ui:relisten:{enc}:{rank}:{ctx}"),
+            InlineKeyboardButton(text="💬 Отзыв", callback_data=f"ui:review:{enc}:{rank}:{ctx}"),
         ],
         [
             InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu"),
@@ -1551,7 +1619,8 @@ async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix
     user_rating = await get_user_rating(user_id, album_list, rank)
     cover = await get_cover_with_fallback(album_list, rank, artist, album)
     in_rel = await is_relisten(user_id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix)
+    user_review = await get_user_review(user_id, album_list, rank)
+    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(user_id, album_list, rank)
     kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
@@ -1594,9 +1663,11 @@ async def edit_album_post(call: CallbackQuery, album_list: str, rank: int, ctx: 
     genre = str(row.get("genre", "") or "")
     user_rating = await get_user_rating(call.from_user.id, album_list, rank)
     in_rel = await is_relisten(call.from_user.id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix)
+    user_review = await get_user_review(call.from_user.id, album_list, rank)
+    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
-    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel)
+    is_fav = await is_favorite(call.from_user.id, album_list, rank)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
 
     try:
         if call.message.photo:
@@ -2294,30 +2365,88 @@ async def pending_text_handler(message: Message):
     ui = await db_get_user_input(message.from_user.id)
     if not ui:
         return
-    if ui.get("mode") != "find_artist":
+
+    mode = ui.get("mode")
+
+    if mode == "find_artist":
+        needle = (message.text or "").strip()
+        if not needle:
+            await message.answer("Пусто. Напиши имя артиста текстом, или /cancel чтобы отменить.")
+            return
+
+        res = await perform_find_artist(message.from_user.id, needle)
+        await db_clear_user_input(message.from_user.id)
+
+        if res.get("error"):
+            await message.answer(res["error"], reply_markup=menu_keyboard())
+            return
+
+        if not res.get("matches"):
+            await message.answer(
+                f"В списке <b>{html.escape(str(res.get('active_list')))}</b> не нашёл: <b>{html.escape(needle)}</b>.",
+                parse_mode="HTML",
+                reply_markup=menu_keyboard(),
+            )
+            return
+
+        await message.answer(res["text"], parse_mode="HTML", reply_markup=res["kb"])
         return
 
-    needle = (message.text or "").strip()
-    if not needle:
-        await message.answer("Пусто. Напиши имя артиста текстом, или /cancel чтобы отменить.")
+    if mode == "review":
+        payload_raw = ui.get("payload") or ""
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except Exception:
+            payload = {}
+        album_list = payload.get("album_list")
+        rank = payload.get("rank")
+        ctx = payload.get("ctx") or "flow"
+        chat_id = payload.get("chat_id") or message.chat.id
+        message_id = payload.get("message_id")
+        is_photo = bool(payload.get("is_photo"))
+
+        txt = (message.text or "").strip()
+        if not album_list or not rank:
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Не смог понять, к какому альбому относится отзыв. Попробуй ещё раз с кнопки.")
+            return
+
+        if txt in ("-", "—", "удалить", "delete", "del"):
+            await delete_user_review(message.from_user.id, album_list, int(rank))
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Удалил отзыв.", reply_markup=menu_keyboard())
+        else:
+            await upsert_user_review(message.from_user.id, album_list, int(rank), txt)
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Сохранил отзыв.", reply_markup=menu_keyboard())
+
+        try:
+            if message_id:
+                df = get_albums(album_list)
+                rows = df.loc[df["rank"] == int(rank)]
+                if not rows.empty:
+                    row = rows.iloc[0]
+                    artist = str(row["artist"])
+                    album = str(row["album"])
+                    genre = str(row.get("genre", "") or "")
+                    ur = await get_user_rating(message.from_user.id, album_list, int(rank))
+                    in_rel = await is_relisten(message.from_user.id, album_list, int(rank))
+                    rev = await get_user_review(message.from_user.id, album_list, int(rank))
+                    caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev)
+                    listen_url = await get_songlink_url(album_list, int(rank), artist, album)
+                    is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
+                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
+
+                    if is_photo:
+                        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+                    else:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=caption, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            log.debug("review refresh edit failed: %s", e)
         return
 
-    res = await perform_find_artist(message.from_user.id, needle)
-    await db_clear_user_input(message.from_user.id)
+    return
 
-    if res.get("error"):
-        await message.answer(res["error"], reply_markup=menu_keyboard())
-        return
-
-    if not res.get("matches"):
-        await message.answer(
-            f"В списке <b>{html.escape(str(res.get('active_list')))}</b> не нашёл: <b>{html.escape(needle)}</b>.",
-            parse_mode="HTML",
-            reply_markup=menu_keyboard(),
-        )
-        return
-
-    await message.answer(res["text"], parse_mode="HTML", reply_markup=res["kb"])
 
 @router.message(Command("export_ratings"))
 async def cmd_export(msg: Message):
@@ -2655,9 +2784,11 @@ async def relisten_toggle_cb(call: CallbackQuery):
     album = str(row["album"])
     genre = str(row.get("genre", "") or "")
     ur = await get_user_rating(call.from_user.id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, ur, in_relisten=enabled)
+    user_review = await get_user_review(call.from_user.id, album_list, rank)
+    caption = album_caption(rank, artist, album, genre, ur, in_relisten=enabled, review=user_review)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
-    kb = album_keyboard(album_list, rank, artist, album, ur, ctx, listen_url, in_relisten=enabled)
+    is_fav = await is_favorite(call.from_user.id, album_list, rank)
+    kb = album_keyboard(album_list, rank, artist, album, ur, ctx, listen_url, in_relisten=enabled, is_fav=is_fav)
 
     try:
         if call.message.photo:
@@ -2723,6 +2854,39 @@ async def ui_daily(call: CallbackQuery):
         await call.answer("Выключил")
         await call.message.answer("☀️ Альбом дня выключен.", reply_markup=menu_keyboard())
 
+
+@router.callback_query(F.data.startswith("ui:review:"))
+async def review_ui(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 5:
+        await call.answer("Ошибка кнопки", show_alert=True)
+        return
+    enc = parts[2]
+    album_list = canonical_list_name(enc)
+    album_list = resolve_list_name(album_list) or album_list
+    rank = int(parts[3])
+    ctx = parts[4]
+
+    await call.answer()
+    payload = json.dumps({
+        "album_list": album_list,
+        "rank": rank,
+        "ctx": ctx,
+        "chat_id": call.message.chat.id if call.message else call.from_user.id,
+        "message_id": call.message.message_id if call.message else None,
+        "is_photo": bool(call.message.photo) if call.message else False,
+    }, ensure_ascii=False)
+    await db_set_user_input(call.from_user.id, "review", payload)
+
+    cur = await get_user_review(call.from_user.id, album_list, rank)
+    cur_txt = f"\n\nТекущий: {html.escape(cur)}" if cur else ""
+    await call.message.answer(
+        "💬 Напиши короткий отзыв одним сообщением.\n"
+        "Удалить отзыв: отправь минус '-'\n"
+        "Отмена: /cancel"
+        + cur_txt
+    )
+
 @router.callback_query(F.data.startswith("ui:rate:"))
 async def rate_ui(call: CallbackQuery):
     parts = call.data.split(":")
@@ -2744,7 +2908,8 @@ async def rate_ui(call: CallbackQuery):
     album = str(row["album"])
     genre = str(row.get("genre", "") or "")
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, current_rating)
+    user_review = await get_user_review(call.from_user.id, album_list, rank)
+    caption = album_caption(rank, artist, album, genre, current_rating, review=user_review)
 
     await call.answer()
     try:
