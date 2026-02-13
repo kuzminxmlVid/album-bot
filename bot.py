@@ -1066,9 +1066,39 @@ async def songlink_page_url_from_any(url: str) -> Optional[str]:
     return None
 
 async def get_songlink_url(album_list: str, rank: int, artist: str, album: str) -> Optional[str]:
+    """Return a universal album.link URL for this album.
+
+    Strategy:
+    1) Check DB cache (songlink_cache).
+    2) Find an Apple Music/iTunes album URL via iTunes Search API.
+    3) Ask Odesli (api.song.link) for a universal pageUrl.
+    4) Prefer album.link domain (replace if needed).
+    5) Cache result.
+    """
     cached = await get_cached_songlink(album_list, rank)
     if cached:
         return cached
+
+    platform_url = await itunes_album_url(artist, album)
+    if not platform_url:
+        return None
+
+    page_url = await songlink_page_url_from_any(platform_url)
+    if not page_url:
+        # fallback: album.link can also resolve a platform URL when appended
+        try:
+            from urllib.parse import quote
+            page_url = "https://album.link/" + quote(platform_url, safe="")
+        except Exception:
+            return None
+
+    # normalize domain to album.link (optional, but requested)
+    if isinstance(page_url, str):
+        page_url = page_url.replace("://song.link/", "://album.link/").replace("://www.song.link/", "://album.link/")
+        page_url = page_url.replace("://song.link", "://album.link").replace("://www.song.link", "://album.link")
+
+    await set_cached_songlink(album_list, rank, page_url)
+    return page_url
 
 
 def _extract_response_text(data: dict) -> str:
@@ -2500,7 +2530,7 @@ async def ui_favorites_cb(call: CallbackQuery):
         "❤️ Любимые\n\n"
         "Тут твои отмеченные альбомы.\n"
         "Rank можно открыть командой /go 77.",
-        reply_markup=favorites_keyboard()
+        reply_markup=favorites_keyboard(),
     )
 
 @router.callback_query(F.data == "ui:favorites_random")
@@ -2525,21 +2555,25 @@ async def ui_favorites_list_cb(call: CallbackQuery):
         await call.message.answer("❤️ Любимых пока нет.")
         return
 
-    lines = [
+    lines_out = [
         "❤️ Любимые (последние добавленные)\n",
         "Rank можно открыть командой /go 77.\n",
     ]
-
     for (lst, rank) in rows:
         info = await _album_by_rank(lst, rank)
         if info:
-            artist = (info.get("artist") or "").replace("\n", " ").strip()
-            album = (info.get("album") or "").replace("\n", " ").strip()
-            lines.append(f"• {rank} — {artist}, {album}. {lst}")
+            artist = str(info.get("artist", "")).strip()
+            album = str(info.get("album", "")).strip()
+            # Книжный формат: • 71 — Artist, Album. list
+            lines_out.append(f"• {rank} — {artist}, {album}. {lst}")
         else:
-            lines.append(f"• {rank}. {lst}")
+            lines_out.append(f"• {rank}. {lst}")
 
-    await call.message.answer("\n".join(lines), reply_markup=favorites_keyboard(), disable_web_page_preview=True)
+    await call.message.answer(
+        "\n".join(lines_out),
+        reply_markup=favorites_keyboard(),
+        disable_web_page_preview=True,
+    )
 
 @router.callback_query(F.data == "ui:stats")
 async def stats_cb(call: CallbackQuery):
