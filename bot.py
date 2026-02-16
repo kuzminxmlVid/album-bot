@@ -1327,14 +1327,18 @@ async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -
 
 # ================= USER REVIEWS (per-user короткий отзыв) =================
 
-REVIEW_MAX_LEN = 240  # hard limit for stored review
+# Храним отзыв длиннее, чем раньше.
+# В посте всё равно показываем укороченную версию, чтобы не упираться в лимиты Telegram.
+REVIEW_MAX_LEN = 1200  # hard limit for stored review (per user per album)
 
 def _normalize_review(text: str) -> str:
     s = (text or "").strip()
     s = re.sub(r"\s+", " ", s)
-    if len(s) > REVIEW_MAX_LEN:
-        s = s[:REVIEW_MAX_LEN].rstrip()
     return s
+
+def _review_too_long(text: str) -> tuple[bool, int]:
+    s = _normalize_review(text)
+    return (len(s) > REVIEW_MAX_LEN, len(s))
 
 async def get_user_review(user_id: int, album_list: str, rank: int) -> Optional[str]:
     async with _pool().acquire() as conn:
@@ -2416,6 +2420,15 @@ async def pending_text_handler(message: Message):
             await db_clear_user_input(message.from_user.id)
             await message.answer("Ок. Удалил отзыв.", reply_markup=menu_keyboard())
         else:
+            too_long, ln = _review_too_long(txt)
+            if too_long:
+                await message.answer(
+                    f"Отзыв слишком длинный: {ln} символов. Максимум: {REVIEW_MAX_LEN}.\n"
+                    "Сократи и отправь ещё раз.\n"
+                    "Отмена: /cancel"
+                )
+                return
+
             await upsert_user_review(message.from_user.id, album_list, int(rank), txt)
             await db_clear_user_input(message.from_user.id)
             await message.answer("Ок. Сохранил отзыв.", reply_markup=menu_keyboard())
@@ -2879,9 +2892,13 @@ async def review_ui(call: CallbackQuery):
     await db_set_user_input(call.from_user.id, "review", payload)
 
     cur = await get_user_review(call.from_user.id, album_list, rank)
-    cur_txt = f"\n\nТекущий: {html.escape(cur)}" if cur else ""
+    cur_preview = None
+    if cur:
+        c = str(cur)
+        cur_preview = (c[:300].rstrip() + "…") if len(c) > 300 else c
+    cur_txt = f"\n\nТекущий: {html.escape(cur_preview)}" if cur_preview else ""
     await call.message.answer(
-        "💬 Напиши короткий отзыв одним сообщением.\n"
+        f"💬 Напиши отзыв одним сообщением (до {REVIEW_MAX_LEN} символов).\n"
         "Удалить отзыв: отправь минус '-'\n"
         "Отмена: /cancel"
         + cur_txt
