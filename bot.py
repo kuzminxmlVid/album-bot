@@ -1619,14 +1619,14 @@ def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: O
         f"{review_line}"
     )
 
-def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, listen_url: Optional[str], *, in_relisten: bool = False, is_fav: bool = False) -> InlineKeyboardMarkup:
+def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: Optional[int], ctx: str, listen_url: Optional[str], *, in_relisten: bool = False, is_fav: bool = False, viewer_user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     rate_text = "⭐ Оценить" if not rated else f"⭐ Оценено: {rated}"
     rel_text = "🔁 Переслушаю ✅" if in_relisten else "🔁 Переслушаю"
     fav_text = "❤️ Любимое ✅" if is_fav else "❤️ Любимое"
     enc = encode_list_name(album_list)
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
-            [InlineKeyboardButton(text=fav_text, callback_data=f"fav:toggle:{album_list}:{rank}"), InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), ],
+        [InlineKeyboardButton(text=fav_text, callback_data=f"fav:toggle:{album_list}:{rank}"), InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), ],
         [
             InlineKeyboardButton(text="Предыдущий", callback_data="nav:prev"),
             InlineKeyboardButton(text="Следующий", callback_data="nav:next"),
@@ -1636,13 +1636,12 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
             InlineKeyboardButton(text=rel_text, callback_data=f"ui:relisten:{enc}:{rank}:{ctx}"),
             InlineKeyboardButton(text="💬 Отзыв", callback_data=f"ui:review:{enc}:{rank}:{ctx}"),
         ],
-        [
-            InlineKeyboardButton(text="📝 Описание", callback_data=f"ui:desc:{enc}:{rank}:{ctx}"),
-        ],
-        [
-            InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu"),
-        ],
-    ])
+        [InlineKeyboardButton(text="📝 Описание", callback_data=f"ui:desc:{enc}:{rank}:{ctx}")],
+    ]
+    if viewer_user_id is not None and is_admin(viewer_user_id):
+        rows.append([InlineKeyboardButton(text="✏️ Изменить описание", callback_data=f"ui:desc_edit:{enc}:{rank}:{ctx}")])
+    rows.append([InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def rating_keyboard(album_list: str, rank: int, ctx: str) -> InlineKeyboardMarkup:
     enc = encode_list_name(album_list)
@@ -1719,7 +1718,7 @@ async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix
     caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review, description=description)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(user_id, album_list, rank)
-    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav, viewer_user_id=user_id)
     return cover, caption, kb, rank, user_rating, artist, album, genre
 
 async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "flow", prefix: str = "") -> None:
@@ -1764,7 +1763,7 @@ async def edit_album_post(call: CallbackQuery, album_list: str, rank: int, ctx: 
     caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review, description=description)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(call.from_user.id, album_list, rank)
-    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
+    kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav, viewer_user_id=call.from_user.id)
 
     try:
         if call.message.photo:
@@ -2175,6 +2174,30 @@ async def cmd_start_albums(msg: Message):
 async def cmd_menu(msg: Message):
     await msg.answer("📋 Меню", reply_markup=menu_keyboard())
 
+@router.message(Command("myid"))
+async def cmd_myid(msg: Message):
+    admin_status = "да" if is_admin(msg.from_user.id) else "нет"
+    await msg.answer(
+        f"Ваш Telegram ID: <code>{msg.from_user.id}</code>\n"
+        f"Админ: <b>{admin_status}</b>",
+        parse_mode="HTML"
+    )
+
+@router.message(Command("admin"))
+async def cmd_admin(msg: Message):
+    if not is_admin(msg.from_user.id):
+        await msg.answer(
+            "Админские функции не включены для этого аккаунта.\n"
+            "Узнай свой ID командой /myid и добавь его в Railway в переменную ADMIN_IDS."
+        )
+        return
+    await msg.answer(
+        "🛠 Админские функции включены.\n\n"
+        "Чтобы добавить описание: открой альбом → нажми ✏️ Изменить описание → пришли текст.\n"
+        f"Лимит описания: {DESCRIPTION_MAX_LEN} символов.\n"
+        "Удалить описание можно сообщением: -"
+    )
+
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
     txt = await build_stats_text(msg.from_user.id)
@@ -2547,7 +2570,7 @@ async def pending_text_handler(message: Message):
                     caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev, description=desc)
                     listen_url = await get_songlink_url(album_list, int(rank), artist, album)
                     is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
-                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
+                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav, viewer_user_id=message.from_user.id)
 
                     if is_photo:
                         await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -2610,7 +2633,7 @@ async def pending_text_handler(message: Message):
                     caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev, description=desc)
                     listen_url = await get_songlink_url(album_list, int(rank), artist, album)
                     is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
-                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
+                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav, viewer_user_id=message.from_user.id)
 
                     if is_photo:
                         await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -2964,7 +2987,7 @@ async def relisten_toggle_cb(call: CallbackQuery):
     caption = album_caption(rank, artist, album, genre, ur, in_relisten=enabled, review=user_review, description=description)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(call.from_user.id, album_list, rank)
-    kb = album_keyboard(album_list, rank, artist, album, ur, ctx, listen_url, in_relisten=enabled, is_fav=is_fav)
+    kb = album_keyboard(album_list, rank, artist, album, ur, ctx, listen_url, in_relisten=enabled, is_fav=is_fav, viewer_user_id=call.from_user.id)
 
     try:
         if call.message.photo:
@@ -3573,7 +3596,7 @@ async def fav_toggle(call: CallbackQuery):
         kb = album_keyboard(
             album_list, rank, info["artist"], info["album"],
             rated, ctx="post", listen_url=listen_url,
-            in_relisten=in_relisten, is_fav=new_state
+            in_relisten=in_relisten, is_fav=new_state, viewer_user_id=call.from_user.id
         )
         await call.message.edit_reply_markup(reply_markup=kb)
     except Exception as e:
