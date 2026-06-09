@@ -1329,7 +1329,7 @@ async def upsert_rating(user_id: int, album_list: str, rank: int, rating: int) -
 
 # Храним отзыв длиннее, чем раньше.
 # В посте всё равно показываем укороченную версию, чтобы не упираться в лимиты Telegram.
-REVIEW_MAX_LEN = 1200  # hard limit for stored review (per user per album)
+REVIEW_MAX_LEN = 2000  # hard limit for stored review (per user per album)
 
 def _normalize_review(text: str) -> str:
     s = (text or "").strip()
