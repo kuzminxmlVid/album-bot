@@ -55,6 +55,9 @@ class Config:
     DAILY_HOUR = int(os.getenv("DAILY_HOUR", "10"))
     DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
 
+    # Comma-separated Telegram user IDs allowed to edit public album descriptions
+    ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
 if not Config.TOKEN or not Config.DATABASE_URL:
     raise RuntimeError("ENV vars not set: TOKEN and/or DATABASE_URL")
 
@@ -279,6 +282,23 @@ async def init_pg() -> None:
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_user_reviews_user
         ON user_reviews (user_id, updated_at DESC)
+        """)
+
+
+        # public admin descriptions for albums (visible to all users)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS album_descriptions (
+            album_list TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            updated_by BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (album_list, rank)
+        )
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_album_descriptions_updated
+        ON album_descriptions (updated_at DESC)
         """)
 
 # daily subscription
@@ -1376,6 +1396,72 @@ def _review_line_for_caption(review: Optional[str]) -> str:
         s = s[:180].rstrip() + "…"
     return f"\n\n💬 <b>Ваш отзыв:</b> {html.escape(s)}"
 
+
+# ================= PUBLIC ALBUM DESCRIPTIONS (admin-managed) =================
+
+DESCRIPTION_MAX_LEN = 3000
+DESCRIPTION_CAPTION_PREVIEW_LEN = 420
+
+def is_admin(user_id: int) -> bool:
+    return int(user_id) in Config.ADMIN_IDS
+
+def _normalize_description(text: str) -> str:
+    # Keep paragraph breaks, but clean excessive spaces inside lines.
+    raw = (text or "").strip()
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw.splitlines()]
+    # Collapse long empty-line runs.
+    cleaned = []
+    empty = 0
+    for line in lines:
+        if not line:
+            empty += 1
+            if empty <= 1:
+                cleaned.append("")
+        else:
+            empty = 0
+            cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+def _description_too_long(text: str) -> tuple[bool, int]:
+    s = _normalize_description(text)
+    return (len(s) > DESCRIPTION_MAX_LEN, len(s))
+
+async def get_album_description(album_list: str, rank: int) -> Optional[str]:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT description FROM album_descriptions WHERE album_list=$1 AND rank=$2",
+            album_list, int(rank)
+        )
+        return str(row["description"]) if row else None
+
+async def upsert_album_description(album_list: str, rank: int, description: str, updated_by: int) -> None:
+    desc_n = _normalize_description(description)
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO album_descriptions (album_list, rank, description, updated_by, updated_at)
+            VALUES ($1,$2,$3,$4,NOW())
+            ON CONFLICT (album_list, rank)
+            DO UPDATE SET description=EXCLUDED.description, updated_by=EXCLUDED.updated_by, updated_at=NOW()
+            """,
+            album_list, int(rank), desc_n, int(updated_by)
+        )
+
+async def delete_album_description(album_list: str, rank: int) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM album_descriptions WHERE album_list=$1 AND rank=$2",
+            album_list, int(rank)
+        )
+
+def _description_line_for_caption(description: Optional[str]) -> str:
+    if not description:
+        return ""
+    s = description.strip()
+    if len(s) > DESCRIPTION_CAPTION_PREVIEW_LEN:
+        s = s[:DESCRIPTION_CAPTION_PREVIEW_LEN].rstrip() + "…"
+    return f"\n\n📝 <b>Описание:</b> {html.escape(s)}"
+
 # ================= RELISTEN ("Переслушаю") =================
 
 async def is_relisten(user_id: int, album_list: str, rank: int) -> bool:
@@ -1515,9 +1601,10 @@ async def send_random_relisten(user_id: int) -> None:
 def google_link(artist: str, album: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(f'{artist} {album}')}"
 
-def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: Optional[int], *, in_relisten: bool = False, prefix: str = "", review: Optional[str] = None) -> str:
+def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: Optional[int], *, in_relisten: bool = False, prefix: str = "", review: Optional[str] = None, description: Optional[str] = None) -> str:
     rating_line = f"\n\n⭐ <b>Ваша оценка:</b> {user_rating}/5" if user_rating else ""
     relisten_line = "\n🔁 <b>Переслушаю:</b> да" if in_relisten else ""
+    description_line = _description_line_for_caption(description)
     review_line = _review_line_for_caption(review)
     header = (prefix + "\n\n") if prefix else ""
     return (
@@ -1528,6 +1615,7 @@ def album_caption(rank: int, artist: str, album: str, genre: str, user_rating: O
         f"🎧 {genre}"
         f"{rating_line}"
         f"{relisten_line}"
+        f"{description_line}"
         f"{review_line}"
     )
 
@@ -1547,6 +1635,9 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
             InlineKeyboardButton(text=rate_text, callback_data=f"ui:rate:{enc}:{rank}:{ctx}"),
             InlineKeyboardButton(text=rel_text, callback_data=f"ui:relisten:{enc}:{rank}:{ctx}"),
             InlineKeyboardButton(text="💬 Отзыв", callback_data=f"ui:review:{enc}:{rank}:{ctx}"),
+        ],
+        [
+            InlineKeyboardButton(text="📝 Описание", callback_data=f"ui:desc:{enc}:{rank}:{ctx}"),
         ],
         [
             InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu"),
@@ -1624,7 +1715,8 @@ async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix
     cover = await get_cover_with_fallback(album_list, rank, artist, album)
     in_rel = await is_relisten(user_id, album_list, rank)
     user_review = await get_user_review(user_id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review)
+    description = await get_album_description(album_list, rank)
+    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review, description=description)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(user_id, album_list, rank)
     kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
@@ -1668,7 +1760,8 @@ async def edit_album_post(call: CallbackQuery, album_list: str, rank: int, ctx: 
     user_rating = await get_user_rating(call.from_user.id, album_list, rank)
     in_rel = await is_relisten(call.from_user.id, album_list, rank)
     user_review = await get_user_review(call.from_user.id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review)
+    description = await get_album_description(album_list, rank)
+    caption = album_caption(rank, artist, album, genre, user_rating, in_relisten=in_rel, prefix=prefix, review=user_review, description=description)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(call.from_user.id, album_list, rank)
     kb = album_keyboard(album_list, rank, artist, album, user_rating, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
@@ -2396,6 +2489,74 @@ async def pending_text_handler(message: Message):
         await message.answer(res["text"], parse_mode="HTML", reply_markup=res["kb"])
         return
 
+    if mode == "album_desc":
+        payload_raw = ui.get("payload") or ""
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except Exception:
+            payload = {}
+        album_list = payload.get("album_list")
+        rank = payload.get("rank")
+        ctx = payload.get("ctx") or "flow"
+        chat_id = payload.get("chat_id") or message.chat.id
+        message_id = payload.get("message_id")
+        is_photo = bool(payload.get("is_photo"))
+
+        if not is_admin(message.from_user.id):
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("У тебя нет прав менять публичные описания.")
+            return
+
+        txt = (message.text or "").strip()
+        if not album_list or not rank:
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Не смог понять, к какому альбому относится описание. Попробуй ещё раз с кнопки.")
+            return
+
+        if txt in ("-", "—", "удалить", "delete", "del"):
+            await delete_album_description(album_list, int(rank))
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Удалил публичное описание альбома.", reply_markup=menu_keyboard())
+        else:
+            too_long, ln = _description_too_long(txt)
+            if too_long:
+                await message.answer(
+                    f"Описание слишком длинное: {ln} символов. Максимум: {DESCRIPTION_MAX_LEN}.\n"
+                    "Сократи и отправь ещё раз.\n"
+                    "Отмена: /cancel"
+                )
+                return
+
+            await upsert_album_description(album_list, int(rank), txt, message.from_user.id)
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Сохранил публичное описание альбома.", reply_markup=menu_keyboard())
+
+        try:
+            if message_id:
+                df = get_albums(album_list)
+                rows = df.loc[df["rank"] == int(rank)]
+                if not rows.empty:
+                    row = rows.iloc[0]
+                    artist = str(row["artist"])
+                    album = str(row["album"])
+                    genre = str(row.get("genre", "") or "")
+                    ur = await get_user_rating(message.from_user.id, album_list, int(rank))
+                    in_rel = await is_relisten(message.from_user.id, album_list, int(rank))
+                    rev = await get_user_review(message.from_user.id, album_list, int(rank))
+                    desc = await get_album_description(album_list, int(rank))
+                    caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev, description=desc)
+                    listen_url = await get_songlink_url(album_list, int(rank), artist, album)
+                    is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
+                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
+
+                    if is_photo:
+                        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+                    else:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=caption, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            log.debug("album description refresh edit failed: %s", e)
+        return
+
     if mode == "review":
         payload_raw = ui.get("payload") or ""
         try:
@@ -2445,7 +2606,8 @@ async def pending_text_handler(message: Message):
                     ur = await get_user_rating(message.from_user.id, album_list, int(rank))
                     in_rel = await is_relisten(message.from_user.id, album_list, int(rank))
                     rev = await get_user_review(message.from_user.id, album_list, int(rank))
-                    caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev)
+                    desc = await get_album_description(album_list, int(rank))
+                    caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev, description=desc)
                     listen_url = await get_songlink_url(album_list, int(rank), artist, album)
                     is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
                     kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav)
@@ -2798,7 +2960,8 @@ async def relisten_toggle_cb(call: CallbackQuery):
     genre = str(row.get("genre", "") or "")
     ur = await get_user_rating(call.from_user.id, album_list, rank)
     user_review = await get_user_review(call.from_user.id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, ur, in_relisten=enabled, review=user_review)
+    description = await get_album_description(album_list, rank)
+    caption = album_caption(rank, artist, album, genre, ur, in_relisten=enabled, review=user_review, description=description)
     listen_url = await get_songlink_url(album_list, rank, artist, album)
     is_fav = await is_favorite(call.from_user.id, album_list, rank)
     kb = album_keyboard(album_list, rank, artist, album, ur, ctx, listen_url, in_relisten=enabled, is_fav=is_fav)
@@ -2868,6 +3031,74 @@ async def ui_daily(call: CallbackQuery):
         await call.message.answer("☀️ Альбом дня выключен.", reply_markup=menu_keyboard())
 
 
+@router.callback_query(F.data.startswith("ui:desc:"))
+async def description_ui(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) != 5:
+        await call.answer("Ошибка кнопки", show_alert=True)
+        return
+    enc = parts[2]
+    album_list = canonical_list_name(enc)
+    album_list = resolve_list_name(album_list) or album_list
+    rank = int(parts[3])
+    ctx = parts[4]
+
+    desc = await get_album_description(album_list, rank)
+    if desc:
+        text = f"📝 <b>Описание альбома #{rank}</b>\nСписок: <b>{html.escape(album_list)}</b>\n\n{html.escape(desc)}"
+    else:
+        text = f"📝 Описания для альбома #{rank} пока нет."
+
+    rows = [[InlineKeyboardButton(text="⬅️ Назад к посту", callback_data=f"ui:back:{enc}:{rank}:{ctx}")]]
+    if is_admin(call.from_user.id):
+        rows.insert(0, [InlineKeyboardButton(text="✏️ Изменить описание", callback_data=f"ui:desc_edit:{enc}:{rank}:{ctx}")])
+
+    await call.answer()
+    await call.message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@router.callback_query(F.data.startswith("ui:desc_edit:"))
+async def description_edit_ui(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Только для админа", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    if len(parts) != 5:
+        await call.answer("Ошибка кнопки", show_alert=True)
+        return
+    enc = parts[2]
+    album_list = canonical_list_name(enc)
+    album_list = resolve_list_name(album_list) or album_list
+    rank = int(parts[3])
+    ctx = parts[4]
+
+    payload = json.dumps({
+        "album_list": album_list,
+        "rank": rank,
+        "ctx": ctx,
+        "chat_id": call.message.chat.id if call.message else call.from_user.id,
+        "message_id": call.message.message_id if call.message else None,
+        "is_photo": bool(call.message.photo) if call.message else False,
+    }, ensure_ascii=False)
+    await db_set_user_input(call.from_user.id, "album_desc", payload)
+
+    cur = await get_album_description(album_list, rank)
+    cur_preview = None
+    if cur:
+        c = str(cur)
+        cur_preview = (c[:700].rstrip() + "…") if len(c) > 700 else c
+    cur_txt = f"\n\nТекущее описание:\n{html.escape(cur_preview)}" if cur_preview else ""
+
+    await call.answer()
+    await call.message.answer(
+        f"📝 Пришли публичное описание альбома одним сообщением (до {DESCRIPTION_MAX_LEN} символов).\n"
+        "Его увидят все пользователи.\n"
+        "Удалить описание: отправь минус '-'\n"
+        "Отмена: /cancel"
+        + cur_txt,
+        parse_mode="HTML"
+    )
+
 @router.callback_query(F.data.startswith("ui:review:"))
 async def review_ui(call: CallbackQuery):
     parts = call.data.split(":")
@@ -2926,7 +3157,8 @@ async def rate_ui(call: CallbackQuery):
     genre = str(row.get("genre", "") or "")
     current_rating = await get_user_rating(call.from_user.id, album_list, rank)
     user_review = await get_user_review(call.from_user.id, album_list, rank)
-    caption = album_caption(rank, artist, album, genre, current_rating, review=user_review)
+    description = await get_album_description(album_list, rank)
+    caption = album_caption(rank, artist, album, genre, current_rating, review=user_review, description=description)
 
     await call.answer()
     try:
