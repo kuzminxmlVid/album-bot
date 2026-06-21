@@ -2023,7 +2023,12 @@ async def format_recent_ratings(user_id: int, album_list: str, limit: int = 10) 
 
 
 async def format_unrated_albums(user_id: int, album_list: str) -> str:
-    """Albums from the current list that the user has not rated yet. Sorted by rank DESC."""
+    """Albums from the current list that the user has not rated yet.
+
+    To avoid spoilers, show only albums that are already open to the user:
+    from the largest rank down to the currently selected album, inclusive.
+    Sorted by rank DESC.
+    """
     try:
         df = get_albums(album_list).copy()
     except Exception:
@@ -2040,6 +2045,29 @@ async def format_unrated_albums(user_id: int, album_list: str) -> str:
             "В списке нет альбомов."
         )
 
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df = df.dropna(subset=["rank"]).copy()
+    df["rank"] = df["rank"].astype(int)
+
+    total = int(len(df))
+
+    try:
+        current_idx = await get_index(user_id, album_list)
+    except Exception:
+        current_idx = total - 1
+
+    if current_idx < 0:
+        current_idx = 0
+    if current_idx >= total:
+        current_idx = total - 1
+
+    current_rank = int(df.sort_values("rank").reset_index(drop=True).iloc[current_idx]["rank"])
+    max_open_rank = int(df["rank"].max())
+
+    # Пользователь идёт по списку от большего rank к меньшему.
+    # Всё, что ниже текущего rank, скрываем, чтобы не спойлерить следующие альбомы.
+    opened_df = df[df["rank"] >= current_rank].copy()
+
     async with _pool().acquire() as conn:
         rated_rows = await conn.fetch(
             "SELECT rank FROM ratings WHERE user_id=$1 AND album_list=$2",
@@ -2047,26 +2075,25 @@ async def format_unrated_albums(user_id: int, album_list: str) -> str:
         )
     rated_ranks = {int(r["rank"]) for r in rated_rows}
 
-    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
-    df = df.dropna(subset=["rank"]).copy()
-    df["rank"] = df["rank"].astype(int)
-    unrated = df[~df["rank"].isin(rated_ranks)].sort_values("rank", ascending=False)
+    unrated = opened_df[~opened_df["rank"].isin(rated_ranks)].sort_values("rank", ascending=False)
 
-    total = int(len(df))
+    opened_total = int(len(opened_df))
     count = int(len(unrated))
     if count == 0:
         return (
             "📋 <b>Альбомы без оценки</b>\n\n"
             f"📃 Список: <b>{html.escape(album_list)}</b>\n"
-            f"Всего: <b>{total}</b>\n\n"
-            "В этом списке всё уже оценено."
+            f"Открытый участок: <b>#{max_open_rank}–#{current_rank}</b>\n"
+            f"Проверено: <b>{opened_total}</b> из <b>{total}</b>\n\n"
+            "На открытом участке всё уже оценено."
         )
 
     lines = [
         "📋 <b>Альбомы без оценки</b>",
         "",
         f"📃 Список: <b>{html.escape(album_list)}</b>",
-        f"Без оценки: <b>{count}</b> из <b>{total}</b>",
+        f"Открытый участок: <b>#{max_open_rank}–#{current_rank}</b>",
+        f"Без оценки: <b>{count}</b> из <b>{opened_total}</b> открытых",
         "",
         "Rank можно открыть командой /go 77.",
         "",
@@ -2428,8 +2455,7 @@ async def cmd_bottom(msg: Message):
 
 @router.message(Command("recent_ratings"))
 async def cmd_recent_ratings(msg: Message):
-    album_list = await get_selected_list(msg.from_user.id)
-    txt = await format_recent_ratings(msg.from_user.id, album_list, limit=10)
+    txt = await format_recent_ratings(msg.from_user.id, limit=10)
     await msg.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard(), disable_web_page_preview=True)
 
 @router.message(Command("streak"))
