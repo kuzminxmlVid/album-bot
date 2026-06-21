@@ -1510,12 +1510,12 @@ async def list_favorites(user_id: int, limit: int = 50, album_list: Optional[str
     async with pg_pool.acquire() as conn:
         if album_list:
             rows = await conn.fetch(
-                "SELECT album_list, rank FROM favorites WHERE user_id=$1 AND album_list=$2 ORDER BY added_at DESC LIMIT $3",
+                "SELECT album_list, rank FROM favorites WHERE user_id=$1 AND album_list=$2 ORDER BY rank DESC LIMIT $3",
                 user_id, album_list, limit
             )
         else:
             rows = await conn.fetch(
-                "SELECT album_list, rank FROM favorites WHERE user_id=$1 ORDER BY added_at DESC LIMIT $2",
+                "SELECT album_list, rank FROM favorites WHERE user_id=$1 ORDER BY album_list, rank DESC LIMIT $2",
                 user_id, limit
             )
         return [(r["album_list"], int(r["rank"])) for r in rows]
@@ -1571,11 +1571,11 @@ async def get_relisten_items(user_id: int, limit: int = 200, album_list: Optiona
     async with _pool().acquire() as conn:
         if album_list:
             return await conn.fetch(
-                "SELECT album_list, rank, added_at FROM relisten WHERE user_id=$1 AND album_list=$2 ORDER BY added_at DESC LIMIT $3",
+                "SELECT album_list, rank, added_at FROM relisten WHERE user_id=$1 AND album_list=$2 ORDER BY rank DESC LIMIT $3",
                 user_id, album_list, limit
             )
         return await conn.fetch(
-            "SELECT album_list, rank, added_at FROM relisten WHERE user_id=$1 ORDER BY added_at DESC LIMIT $2",
+            "SELECT album_list, rank, added_at FROM relisten WHERE user_id=$1 ORDER BY album_list, rank DESC LIMIT $2",
             user_id, limit
         )
 
@@ -1745,21 +1745,25 @@ def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Продолжить", callback_data="nav:next")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="ui:stats")],
-        [InlineKeyboardButton(text="📈 Статистика+", callback_data="ui:stats_plus")],
         [InlineKeyboardButton(text="🔁 Переслушать", callback_data="ui:relisten_menu")],
         [InlineKeyboardButton(text="❤️ Любимые", callback_data="ui:favorites")],
         [InlineKeyboardButton(text="🔎 Поиск артиста", callback_data="ui:find_artist")],
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
-def stats_plus_keyboard() -> InlineKeyboardMarkup:
+
+def stats_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="ui:stats_summary")],
         [InlineKeyboardButton(text="🏆 Лучшие альбомы", callback_data="ui:best_albums")],
         [InlineKeyboardButton(text="👌 Ниче так", callback_data="ui:ok_albums")],
         [InlineKeyboardButton(text="🧨 Худшие альбомы", callback_data="ui:worst_albums")],
         [InlineKeyboardButton(text="🕘 Последние 10 оценок", callback_data="ui:recent_ratings")],
-        [InlineKeyboardButton(text="🧠 Инсайты", callback_data="ui:insights")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="ui:menu")],
+        [InlineKeyboardButton(text="📋 Показать альбомы без оценки", callback_data="ui:unrated_albums")],
+        [InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")],
     ])
+
+# Совместимость со старыми кнопками «Статистика+» в уже отправленных сообщениях.
+stats_plus_keyboard = stats_keyboard
 
 def relisten_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1928,7 +1932,7 @@ async def format_ratings_bucket(user_id: int, album_list: str, ratings: list[int
             SELECT rank, rating, rated_at
             FROM ratings
             WHERE user_id=$1 AND album_list=$2 AND rating = ANY($3::int[])
-            ORDER BY rating ASC, rated_at DESC
+            ORDER BY rank DESC
             """,
             user_id, album_list, ratings
         )
@@ -1966,7 +1970,7 @@ async def format_ratings_bucket(user_id: int, album_list: str, ratings: list[int
 async def format_top_bottom(user_id: int, album_list: str, *, top: bool, limit: int = 10) -> str:
     """Compatibility for old /top and /bottom commands/buttons.
 
-    По новой логике: лучшие = оценки 1 и 2, худшие = оценка 5.
+    По новой логике: лучшие = оценка 5, худшие = оценки 1 и 2.
     """
     if top:
         return await format_ratings_bucket(user_id, album_list, [5], "🏆 <b>Лучшие альбомы</b>")
@@ -1988,7 +1992,13 @@ async def format_recent_ratings(user_id: int, limit: int = 10) -> str:
     if not rows:
         return "🕘 <b>Последние 10 оценок</b>\n\nПока нет оценок."
 
-    lines = ["🕘 <b>Последние 10 оценок</b>", "", "Rank можно открыть командой /go top100 77.", ""]
+    lines = [
+        "🕘 <b>Последние 10 оценок</b>",
+        "",
+        "Учитываются оценки из всех списков.",
+        "Открыть альбом можно командой вида: /go top100 77.",
+        "",
+    ]
     for i, r in enumerate(rows, 1):
         lst = str(r["album_list"])
         rank = int(r["rank"])
@@ -2002,9 +2012,66 @@ async def format_recent_ratings(user_id: int, limit: int = 10) -> str:
         if info:
             artist = html.escape(str(info.get("artist", "")).strip())
             album = html.escape(str(info.get("album", "")).strip())
-            lines.append(f"{i}. {when} — {html.escape(lst)} #{rank} — {artist} — {album} — <b>{rating}/5</b>")
+            lines.append(f"{i}. {when} — {html.escape(lst)} #{rank} — {artist} — {album} — <b>{rating}/5</b> · /go {html.escape(lst)} {rank}")
         else:
-            lines.append(f"{i}. {when} — {html.escape(lst)} #{rank} — <b>{rating}/5</b>")
+            lines.append(f"{i}. {when} — {html.escape(lst)} #{rank} — <b>{rating}/5</b> · /go {html.escape(lst)} {rank}")
+    return "\n".join(lines)
+
+
+async def format_unrated_albums(user_id: int, album_list: str) -> str:
+    """Albums from the current list that the user has not rated yet. Sorted by rank DESC."""
+    try:
+        df = get_albums(album_list).copy()
+    except Exception:
+        return (
+            "📋 <b>Альбомы без оценки</b>\n\n"
+            f"📃 Список: <b>{html.escape(album_list)}</b>\n\n"
+            "Не смог прочитать этот список."
+        )
+
+    if df.empty:
+        return (
+            "📋 <b>Альбомы без оценки</b>\n\n"
+            f"📃 Список: <b>{html.escape(album_list)}</b>\n\n"
+            "В списке нет альбомов."
+        )
+
+    async with _pool().acquire() as conn:
+        rated_rows = await conn.fetch(
+            "SELECT rank FROM ratings WHERE user_id=$1 AND album_list=$2",
+            user_id, album_list
+        )
+    rated_ranks = {int(r["rank"]) for r in rated_rows}
+
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    df = df.dropna(subset=["rank"]).copy()
+    df["rank"] = df["rank"].astype(int)
+    unrated = df[~df["rank"].isin(rated_ranks)].sort_values("rank", ascending=False)
+
+    total = int(len(df))
+    count = int(len(unrated))
+    if count == 0:
+        return (
+            "📋 <b>Альбомы без оценки</b>\n\n"
+            f"📃 Список: <b>{html.escape(album_list)}</b>\n"
+            f"Всего: <b>{total}</b>\n\n"
+            "В этом списке всё уже оценено."
+        )
+
+    lines = [
+        "📋 <b>Альбомы без оценки</b>",
+        "",
+        f"📃 Список: <b>{html.escape(album_list)}</b>",
+        f"Без оценки: <b>{count}</b> из <b>{total}</b>",
+        "",
+        "Rank можно открыть командой /go 77.",
+        "",
+    ]
+    for i, row in enumerate(unrated.itertuples(index=False), 1):
+        rank = int(getattr(row, "rank"))
+        artist = html.escape(str(getattr(row, "artist", "")).strip())
+        album = html.escape(str(getattr(row, "album", "")).strip())
+        lines.append(f"{i}. #{rank} — {artist} — {album}")
     return "\n".join(lines)
 
 async def streak_text(user_id: int) -> str:
@@ -2291,7 +2358,7 @@ async def cmd_start(msg: Message):
         "Начать: /start_albums\n"
         "Меню: /menu\n"
         "Списки: /lists\n"
-        "Статистика: /stats\n"
+        "Общая статистика: /stats\n"
         "Альбом из другого списка: /next_from <название>\n"
     )
     await msg.answer(text, reply_markup=menu_keyboard())
@@ -2342,23 +2409,23 @@ async def cmd_admin(msg: Message):
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
     txt = await build_stats_text(msg.from_user.id)
-    await msg.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
+    await msg.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard())
 @router.message(Command("top"))
 async def cmd_top(msg: Message):
     album_list = await get_selected_list(msg.from_user.id)
     txt = await format_top_bottom(msg.from_user.id, album_list, top=True, limit=10)
-    await send_html_chunks(msg.from_user.id, txt, reply_markup=menu_keyboard())
+    await send_html_chunks(msg.from_user.id, txt, reply_markup=stats_keyboard())
 
 @router.message(Command("bottom"))
 async def cmd_bottom(msg: Message):
     album_list = await get_selected_list(msg.from_user.id)
     txt = await format_top_bottom(msg.from_user.id, album_list, top=False, limit=10)
-    await send_html_chunks(msg.from_user.id, txt, reply_markup=menu_keyboard())
+    await send_html_chunks(msg.from_user.id, txt, reply_markup=stats_keyboard())
 
 @router.message(Command("recent_ratings"))
 async def cmd_recent_ratings(msg: Message):
     txt = await format_recent_ratings(msg.from_user.id, limit=10)
-    await msg.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard(), disable_web_page_preview=True)
+    await msg.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard(), disable_web_page_preview=True)
 
 @router.message(Command("streak"))
 async def cmd_streak(msg: Message):
@@ -3228,53 +3295,68 @@ async def ui_favorites_list_filter_cb(call: CallbackQuery):
 async def stats_cb(call: CallbackQuery):
     txt = await build_stats_text(call.from_user.id)
     await call.answer()
-    await call.message.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard())
 
 
 @router.callback_query(F.data == "ui:stats_plus")
 async def stats_plus_cb(call: CallbackQuery):
+    # Старые кнопки из уже отправленных сообщений ведут в объединённый раздел статистики.
+    txt = await build_stats_text(call.from_user.id)
     await call.answer()
-    await call.message.answer("📈 Выбери раздел", reply_markup=stats_plus_keyboard())
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard())
+
+@router.callback_query(F.data == "ui:stats_summary")
+async def stats_summary_cb(call: CallbackQuery):
+    txt = await build_stats_text(call.from_user.id)
+    await call.answer()
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard())
+
+@router.callback_query(F.data == "ui:unrated_albums")
+async def unrated_albums_cb(call: CallbackQuery):
+    album_list = await get_selected_list(call.from_user.id)
+    txt = await format_unrated_albums(call.from_user.id, album_list)
+    await call.answer()
+    await send_html_chunks(call.from_user.id, txt, reply_markup=stats_keyboard())
 
 @router.callback_query(lambda c: c.data in {"ui:best_albums", "ui:top"})
 async def best_albums_cb(call: CallbackQuery):
     album_list = await get_selected_list(call.from_user.id)
     txt = await format_ratings_bucket(call.from_user.id, album_list, [5], "🏆 <b>Лучшие альбомы</b>")
     await call.answer()
-    await send_html_chunks(call.from_user.id, txt, reply_markup=menu_keyboard())
+    await send_html_chunks(call.from_user.id, txt, reply_markup=stats_keyboard())
 
 @router.callback_query(F.data == "ui:ok_albums")
 async def ok_albums_cb(call: CallbackQuery):
     album_list = await get_selected_list(call.from_user.id)
     txt = await format_ratings_bucket(call.from_user.id, album_list, [3, 4], "👌 <b>Ниче так</b>")
     await call.answer()
-    await send_html_chunks(call.from_user.id, txt, reply_markup=menu_keyboard())
+    await send_html_chunks(call.from_user.id, txt, reply_markup=stats_keyboard())
 
 @router.callback_query(lambda c: c.data in {"ui:worst_albums", "ui:bottom"})
 async def worst_albums_cb(call: CallbackQuery):
     album_list = await get_selected_list(call.from_user.id)
     txt = await format_ratings_bucket(call.from_user.id, album_list, [1, 2], "🧨 <b>Худшие альбомы</b>")
     await call.answer()
-    await send_html_chunks(call.from_user.id, txt, reply_markup=menu_keyboard())
+    await send_html_chunks(call.from_user.id, txt, reply_markup=stats_keyboard())
 
 @router.callback_query(F.data == "ui:recent_ratings")
 async def recent_ratings_cb(call: CallbackQuery):
     txt = await format_recent_ratings(call.from_user.id, limit=10)
     await call.answer()
-    await call.message.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard(), disable_web_page_preview=True)
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard(), disable_web_page_preview=True)
 
 @router.callback_query(F.data == "ui:streak")
 async def streak_cb(call: CallbackQuery):
     # Старые кнопки из уже отправленных сообщений не ломаем, но новый раздел в меню больше не показывается.
     txt = await streak_text(call.from_user.id)
     await call.answer()
-    await call.message.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard())
 
 @router.callback_query(F.data == "ui:insights")
 async def insights_cb(call: CallbackQuery):
     txt = await insights_text(call.from_user.id)
     await call.answer()
-    await call.message.answer(txt, parse_mode="HTML", reply_markup=menu_keyboard())
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard())
 
 @router.callback_query(F.data == "ui:relisten_menu")
 async def relisten_menu_cb(call: CallbackQuery):
