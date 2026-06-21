@@ -6,8 +6,11 @@ import asyncio
 import json
 import logging
 import html
+import random
+import hashlib
+from pathlib import Path
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v62-2026-06-21_stats-sections")
+BOT_VERSION = os.getenv("BOT_VERSION", "v63-2026-06-21_auto-messages")
 AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
 from typing import Any, Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
@@ -18,7 +21,7 @@ import pandas as pd
 import aiohttp
 import asyncpg
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
@@ -66,6 +69,342 @@ if Config.DATABASE_URL.startswith("postgres://"):
     Config.DATABASE_URL = Config.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 
+# ================= AUTO MESSAGES =================
+
+AUTO_REMINDER_START_HOUR = 9
+AUTO_REMINDER_END_HOUR = 22
+COMPLETION_CAT_FILENAME = "cat_headphones.png"
+
+REMINDER_TEXT = (
+    "🎧✨ Хочешь послушать сегодня немного качественной музыки? "
+    "Будет приятно, интересно и очень музыкально! 😺🎶💿"
+)
+
+ACTION_TYPE_LABELS = {
+    "rating": "оценки",
+    "navigation": "переходы по альбомам",
+    "favorite": "добавления в любимое",
+    "relisten": "отметки «переслушаю»",
+    "review": "отзывы",
+    "search": "поиски",
+    "ai_info": "карточки об артисте",
+    "admin_edit": "админские правки",
+    "button": "нажатия кнопок",
+    "message": "сообщения",
+    "command": "команды",
+    "other": "другие действия",
+}
+
+
+def _daily_random_minute(user_id: int, local_day: date) -> int:
+    seed_src = f"{int(user_id)}:{local_day.isoformat()}".encode("utf-8")
+    seed = int(hashlib.sha256(seed_src).hexdigest()[:12], 16)
+    rng = random.Random(seed)
+    start = AUTO_REMINDER_START_HOUR * 60
+    end = AUTO_REMINDER_END_HOUR * 60
+    return rng.randint(start, end)
+
+
+async def get_user_tz_name(user_id: int) -> str:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT tz FROM user_timezones WHERE user_id=$1", int(user_id))
+        if row and row["tz"]:
+            return str(row["tz"])
+        row = await conn.fetchrow("SELECT tz FROM daily_subscriptions WHERE user_id=$1", int(user_id))
+        tz_name = str(row["tz"]) if row and row["tz"] else Config.DAILY_TZ
+        await conn.execute(
+            "INSERT INTO user_timezones (user_id, tz) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING",
+            int(user_id), tz_name,
+        )
+        return tz_name
+
+
+async def get_user_tzinfo(user_id: int) -> ZoneInfo:
+    tz_name = await get_user_tz_name(user_id)
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo(Config.DAILY_TZ)
+
+
+async def ensure_daily_state(user_id: int, local_day: date) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_daily_state (user_id, local_date, reminder_minute, reminder_sent, summary_sent)
+            VALUES ($1, $2, $3, FALSE, FALSE)
+            ON CONFLICT (user_id, local_date) DO NOTHING
+            """,
+            int(user_id), local_day, _daily_random_minute(int(user_id), local_day)
+        )
+
+
+async def mark_user_action(user_id: int, action_type: str) -> None:
+    try:
+        await ensure_user(int(user_id))
+        tz = await get_user_tzinfo(int(user_id))
+        now_local = datetime.now(tz)
+        local_day = now_local.date()
+        await ensure_daily_state(int(user_id), local_day)
+        async with _pool().acquire() as conn:
+            await conn.execute(
+                "INSERT INTO user_activity_log (user_id, local_date, action_type, created_at) VALUES ($1,$2,$3,NOW())",
+                int(user_id), local_day, str(action_type or 'other')[:64]
+            )
+    except Exception as e:
+        log.debug("mark_user_action failed for user=%s: %s", user_id, e)
+
+
+def infer_action_type(event: Any) -> str:
+    if isinstance(event, CallbackQuery):
+        data = (event.data or "").strip()
+        if data.startswith("rate:") or data.startswith("ui:rate:"):
+            return "rating"
+        if data.startswith("nav:"):
+            return "navigation"
+        if data.startswith("fav:toggle:") or data.startswith("ui:favorites"):
+            return "favorite"
+        if data.startswith("ui:relisten"):
+            return "relisten"
+        if data.startswith("ui:review:"):
+            return "review"
+        if data.startswith("ui:find"):
+            return "search"
+        if data.startswith("ai:"):
+            return "ai_info"
+        if any(data.startswith(x) for x in ("ui:description:", "ui:link_edit:", "ui:cover_edit:", "ui:desc_edit:")):
+            return "admin_edit"
+        if data.startswith("ui:"):
+            return "button"
+        return "other"
+    if isinstance(event, Message):
+        txt = (event.text or event.caption or "").strip()
+        if txt.startswith("/"):
+            cmd = txt.split()[0][1:].split("@")[0].lower()
+            if cmd == "go":
+                return "navigation"
+            if cmd in {"find", "artist", "search"}:
+                return "search"
+            return "command"
+        return "message"
+    return "other"
+
+
+class ActivityMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user:
+            await mark_user_action(int(user.id), infer_action_type(event))
+        return await handler(event, data)
+
+
+async def get_day_action_count(user_id: int, local_day: date) -> int:
+    async with _pool().acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_activity_log WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+        return int(val or 0)
+
+
+async def get_day_action_breakdown(user_id: int, local_day: date) -> list[tuple[str, int]]:
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT action_type, COUNT(*) AS c
+            FROM user_activity_log
+            WHERE user_id=$1 AND local_date=$2
+            GROUP BY action_type
+            ORDER BY c DESC, action_type ASC
+            """,
+            int(user_id), local_day
+        )
+    return [(str(r["action_type"]), int(r["c"])) for r in rows]
+
+
+async def build_daily_summary_text(user_id: int, local_day: date) -> str:
+    total = await get_day_action_count(int(user_id), local_day)
+    parts = await get_day_action_breakdown(int(user_id), local_day)
+    if total <= 0:
+        return ""
+    nice_parts = []
+    for key, cnt in parts[:8]:
+        label = ACTION_TYPE_LABELS.get(key, key)
+        nice_parts.append(f"• {html.escape(label)}: <b>{cnt}</b>")
+    praise = "Хороший темп. Так держать. 🎵"
+    if total >= 10:
+        praise = "Очень бодрый день. Ты сегодня реально хорошо походил по музыке. 🚀"
+    elif total >= 4:
+        praise = "Нормально поработал со списком. Уже есть движение. 🙌"
+    return (
+        f"🌙 <b>Итоги дня</b> — {local_day.strftime('%d.%m.%Y')}\n\n"
+        f"Всего действий: <b>{total}</b>\n"
+        + ("\n".join(nice_parts) if nice_parts else "")
+        + f"\n\n{praise}"
+    )
+
+
+async def send_inactivity_reminder_if_needed(user_id: int) -> None:
+    tz = await get_user_tzinfo(int(user_id))
+    now_local = datetime.now(tz)
+    local_day = now_local.date()
+    minute_now = now_local.hour * 60 + now_local.minute
+    await ensure_daily_state(int(user_id), local_day)
+    async with _pool().acquire() as conn:
+        st = await conn.fetchrow(
+            "SELECT reminder_minute, reminder_sent FROM user_daily_state WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+        if not st:
+            return
+        reminder_minute = int(st["reminder_minute"])
+        reminder_sent = bool(st["reminder_sent"])
+        if reminder_sent or minute_now < reminder_minute:
+            return
+        actions = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_activity_log WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+        if int(actions or 0) == 0:
+            await bot.send_message(int(user_id), REMINDER_TEXT)
+        await conn.execute(
+            "UPDATE user_daily_state SET reminder_sent=TRUE WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+
+
+async def send_end_of_day_summary_if_needed(user_id: int) -> None:
+    tz = await get_user_tzinfo(int(user_id))
+    now_local = datetime.now(tz)
+    local_day = now_local.date()
+    minute_now = now_local.hour * 60 + now_local.minute
+    if minute_now < AUTO_REMINDER_END_HOUR * 60:
+        return
+    await ensure_daily_state(int(user_id), local_day)
+    async with _pool().acquire() as conn:
+        st = await conn.fetchrow(
+            "SELECT summary_sent FROM user_daily_state WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+        if st and bool(st["summary_sent"]):
+            return
+        actions = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_activity_log WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+        if int(actions or 0) > 0:
+            txt = await build_daily_summary_text(int(user_id), local_day)
+            if txt:
+                await bot.send_message(int(user_id), txt, parse_mode="HTML", disable_notification=True)
+        await conn.execute(
+            "UPDATE user_daily_state SET summary_sent=TRUE WHERE user_id=$1 AND local_date=$2",
+            int(user_id), local_day
+        )
+
+
+async def auto_messages_loop() -> None:
+    while True:
+        try:
+            async with _pool().acquire() as conn:
+                users = await conn.fetch("SELECT user_id FROM users")
+            for row in users:
+                user_id = int(row["user_id"])
+                try:
+                    await send_inactivity_reminder_if_needed(user_id)
+                    await send_end_of_day_summary_if_needed(user_id)
+                except Exception as e:
+                    log.debug("auto messages failed for user=%s: %s", user_id, e)
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("auto messages loop crashed")
+            await asyncio.sleep(5)
+
+
+async def mark_list_completed(user_id: int, album_list: str) -> bool:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT is_completed FROM list_completion_state WHERE user_id=$1 AND album_list=$2",
+            int(user_id), album_list
+        )
+        already = bool(row["is_completed"]) if row else False
+        await conn.execute(
+            """
+            INSERT INTO list_completion_state (user_id, album_list, is_completed, updated_at)
+            VALUES ($1,$2,TRUE,NOW())
+            ON CONFLICT (user_id, album_list)
+            DO UPDATE SET is_completed=TRUE, updated_at=NOW()
+            """,
+            int(user_id), album_list
+        )
+        return not already
+
+
+async def clear_list_completed(user_id: int, album_list: str) -> None:
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO list_completion_state (user_id, album_list, is_completed, updated_at)
+            VALUES ($1,$2,FALSE,NOW())
+            ON CONFLICT (user_id, album_list)
+            DO UPDATE SET is_completed=FALSE, updated_at=NOW()
+            """,
+            int(user_id), album_list
+        )
+
+
+async def build_list_completion_text(user_id: int, album_list: str) -> str:
+    total = len(get_albums(album_list))
+    async with _pool().acquire() as conn:
+        rated_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM ratings WHERE user_id=$1 AND album_list=$2",
+            int(user_id), album_list
+        )
+        avg = await conn.fetchval(
+            "SELECT AVG(rating) FROM ratings WHERE user_id=$1 AND album_list=$2",
+            int(user_id), album_list
+        )
+        median = await conn.fetchval(
+            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rating) FROM ratings WHERE user_id=$1 AND album_list=$2",
+            int(user_id), album_list
+        )
+        dist_rows = await conn.fetch(
+            "SELECT rating, COUNT(*) AS c FROM ratings WHERE user_id=$1 AND album_list=$2 GROUP BY rating ORDER BY rating",
+            int(user_id), album_list
+        )
+    dist = {int(r['rating']): int(r['c']) for r in dist_rows}
+    avg_txt = f"{float(avg):.2f}" if avg is not None else "—"
+    med_txt = f"{float(median):.1f}" if median is not None else "—"
+    others = [n for n in list_file_names() if n != album_list][:3]
+    next_hint = f"Следом можно открыть: <b>{html.escape(', '.join(others))}</b>." if others else "Выбирай следующий список и продолжай слушать."
+    return (
+        f"🎉 <b>Список завершён</b>\n\n"
+        f"Ты дослушал список <b>{html.escape(album_list)}</b>. Это сильно. Продолжай в том же духе.\n\n"
+        f"📊 <b>Итог по списку</b>\n"
+        f"• Оценено: <b>{int(rated_count or 0)}</b> из <b>{total}</b>\n"
+        f"• Средняя: <b>{avg_txt}</b>\n"
+        f"• Медиана: <b>{med_txt}</b>\n"
+        f"• Оценок 5: <b>{dist.get(5, 0)}</b>\n"
+        f"• Оценок 1–2: <b>{dist.get(1, 0) + dist.get(2, 0)}</b>\n\n"
+        f"{next_hint} 😺🎧"
+    )
+
+
+async def send_list_completed_message(user_id: int, album_list: str) -> None:
+    text = await build_list_completion_text(int(user_id), album_list)
+    cat_path = os.path.join(Config.BASE_DIR, COMPLETION_CAT_FILENAME)
+    if os.path.exists(cat_path):
+        try:
+            data = Path(cat_path).read_bytes()
+            photo = BufferedInputFile(data, filename=COMPLETION_CAT_FILENAME)
+            await bot.send_photo(int(user_id), photo, caption=text, parse_mode="HTML", reply_markup=lists_keyboard())
+            return
+        except Exception as e:
+            log.debug("completion cat send failed: %s", e)
+    await bot.send_message(int(user_id), text, parse_mode="HTML", reply_markup=lists_keyboard())
+
+
 # ================= AI (OpenAI) =================
 
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -109,6 +448,7 @@ router = Router()
 pg_pool: Optional[asyncpg.Pool] = None
 http_session: Optional[aiohttp.ClientSession] = None
 daily_task: Optional[asyncio.Task] = None
+auto_messages_task: Optional[asyncio.Task] = None
 
 # ================= DATABASE =================
 
@@ -315,6 +655,49 @@ async def init_pg() -> None:
         )
         """)
 
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_timezones (
+            user_id BIGINT PRIMARY KEY,
+            tz TEXT NOT NULL
+        )
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_activity_log (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            local_date DATE NOT NULL,
+            action_type TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_activity_log_user_day
+        ON user_activity_log (user_id, local_date, created_at DESC)
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_daily_state (
+            user_id BIGINT NOT NULL,
+            local_date DATE NOT NULL,
+            reminder_minute INTEGER NOT NULL,
+            reminder_sent BOOLEAN NOT NULL DEFAULT FALSE,
+            summary_sent BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (user_id, local_date)
+        )
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS list_completion_state (
+            user_id BIGINT NOT NULL,
+            album_list TEXT NOT NULL,
+            is_completed BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, album_list)
+        )
+        """)
+
 # ================= LIST NAMES =================
 
 def canonical_list_name(name: str) -> str:
@@ -514,6 +897,11 @@ async def set_index(user_id: int, list_name: str, idx: int) -> None:
             "ON CONFLICT (user_id, album_list) DO UPDATE SET current_index=EXCLUDED.current_index, updated_at=EXCLUDED.updated_at",
             user_id, list_name, idx, now
         )
+    if idx >= 0:
+        try:
+            await clear_list_completed(user_id, list_name)
+        except Exception:
+            pass
 
 # ================= HTTP =================
 
@@ -1815,7 +2203,14 @@ async def render_album(user_id: int, album_list: str, idx: int, ctx: str, prefix
 async def send_album_post(user_id: int, album_list: str, idx: int, ctx: str = "flow", prefix: str = "") -> None:
     cover, caption, kb, rank, _, _, _, _ = await render_album(user_id, album_list, idx, ctx=ctx, prefix=prefix)
     if caption.startswith("📭"):
-        await bot.send_message(user_id, caption)
+        try:
+            is_new_completion = await mark_list_completed(user_id, album_list)
+        except Exception:
+            is_new_completion = False
+        if is_new_completion:
+            await send_list_completed_message(user_id, album_list)
+        else:
+            await bot.send_message(user_id, caption)
         return
 
     if cover:
@@ -3795,11 +4190,17 @@ async def back(call: CallbackQuery):
 # ================= START / SHUTDOWN =================
 
 async def on_shutdown() -> None:
-    global http_session, daily_task
+    global http_session, daily_task, auto_messages_task
     if daily_task and not daily_task.done():
         daily_task.cancel()
         try:
             await daily_task
+        except Exception:
+            pass
+    if auto_messages_task and not auto_messages_task.done():
+        auto_messages_task.cancel()
+        try:
+            await auto_messages_task
         except Exception:
             pass
     if http_session and not http_session.closed:
@@ -4160,14 +4561,16 @@ async def cb_unknown_callback(call: CallbackQuery):
 
 async def main():
     log.info("Bot version: %s", BOT_VERSION)
-    global daily_task
+    global daily_task, auto_messages_task
     await init_pg()
     await init_http()
 
+    dp.update.outer_middleware(ActivityMiddleware())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
 
     daily_task = asyncio.create_task(daily_loop())
+    auto_messages_task = asyncio.create_task(auto_messages_loop())
 
     try:
         await dp.start_polling(bot)
