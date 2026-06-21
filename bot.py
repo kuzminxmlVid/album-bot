@@ -1753,7 +1753,6 @@ def menu_keyboard() -> InlineKeyboardMarkup:
 
 def stats_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="ui:stats_summary")],
         [InlineKeyboardButton(text="🏆 Лучшие альбомы", callback_data="ui:best_albums")],
         [InlineKeyboardButton(text="👌 Ниче так", callback_data="ui:ok_albums")],
         [InlineKeyboardButton(text="🧨 Худшие альбомы", callback_data="ui:worst_albums")],
@@ -1976,27 +1975,32 @@ async def format_top_bottom(user_id: int, album_list: str, *, top: bool, limit: 
         return await format_ratings_bucket(user_id, album_list, [5], "🏆 <b>Лучшие альбомы</b>")
     return await format_ratings_bucket(user_id, album_list, [1, 2], "🧨 <b>Худшие альбомы</b>")
 
-async def format_recent_ratings(user_id: int, limit: int = 10) -> str:
+async def format_recent_ratings(user_id: int, album_list: str, limit: int = 10) -> str:
+    """Last ratings from the current selected list only."""
     tz = ZoneInfo(Config.DAILY_TZ)
     async with _pool().acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT album_list, rank, rating, rated_at
             FROM ratings
-            WHERE user_id=$1
+            WHERE user_id=$1 AND album_list=$2
             ORDER BY rated_at DESC
-            LIMIT $2
+            LIMIT $3
             """,
-            user_id, limit
+            user_id, album_list, limit
         )
     if not rows:
-        return "🕘 <b>Последние 10 оценок</b>\n\nПока нет оценок."
+        return (
+            "🕘 <b>Последние 10 оценок</b>\n\n"
+            f"📃 Список: <b>{html.escape(album_list)}</b>\n\n"
+            "В этом списке пока нет оценок."
+        )
 
     lines = [
         "🕘 <b>Последние 10 оценок</b>",
         "",
-        "Учитываются оценки из всех списков.",
-        "Открыть альбом можно командой вида: /go top100 77.",
+        f"📃 Список: <b>{html.escape(album_list)}</b>",
+        "Открыть альбом можно командой /go 77.",
         "",
     ]
     for i, r in enumerate(rows, 1):
@@ -2012,9 +2016,9 @@ async def format_recent_ratings(user_id: int, limit: int = 10) -> str:
         if info:
             artist = html.escape(str(info.get("artist", "")).strip())
             album = html.escape(str(info.get("album", "")).strip())
-            lines.append(f"{i}. {when} — {html.escape(lst)} #{rank} — {artist} — {album} — <b>{rating}/5</b> · /go {html.escape(lst)} {rank}")
+            lines.append(f"{i}. {when} — #{rank} — {artist} — {album} — <b>{rating}/5</b>")
         else:
-            lines.append(f"{i}. {when} — {html.escape(lst)} #{rank} — <b>{rating}/5</b> · /go {html.escape(lst)} {rank}")
+            lines.append(f"{i}. {when} — #{rank} — <b>{rating}/5</b>")
     return "\n".join(lines)
 
 
@@ -2424,7 +2428,8 @@ async def cmd_bottom(msg: Message):
 
 @router.message(Command("recent_ratings"))
 async def cmd_recent_ratings(msg: Message):
-    txt = await format_recent_ratings(msg.from_user.id, limit=10)
+    album_list = await get_selected_list(msg.from_user.id)
+    txt = await format_recent_ratings(msg.from_user.id, album_list, limit=10)
     await msg.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard(), disable_web_page_preview=True)
 
 @router.message(Command("streak"))
@@ -3341,7 +3346,8 @@ async def worst_albums_cb(call: CallbackQuery):
 
 @router.callback_query(F.data == "ui:recent_ratings")
 async def recent_ratings_cb(call: CallbackQuery):
-    txt = await format_recent_ratings(call.from_user.id, limit=10)
+    album_list = await get_selected_list(call.from_user.id)
+    txt = await format_recent_ratings(call.from_user.id, album_list, limit=10)
     await call.answer()
     await call.message.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard(), disable_web_page_preview=True)
 
