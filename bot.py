@@ -26,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BufferedInputFile,
+    InputMediaPhoto,
 )
 from aiogram.exceptions import TelegramBadRequest
 # ================= LOGGING =================
@@ -1640,6 +1641,10 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
     ]
     if viewer_user_id is not None and is_admin(viewer_user_id):
         rows.append([InlineKeyboardButton(text="✏️ Изменить описание", callback_data=f"ui:desc_edit:{enc}:{rank}:{ctx}")])
+        rows.append([
+            InlineKeyboardButton(text="🔗 Изменить ссылку", callback_data=f"ui:link_edit:{enc}:{rank}:{ctx}"),
+            InlineKeyboardButton(text="🖼 Изменить обложку", callback_data=f"ui:cover_edit:{enc}:{rank}:{ctx}"),
+        ])
     rows.append([InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2193,9 +2198,11 @@ async def cmd_admin(msg: Message):
         return
     await msg.answer(
         "🛠 Админские функции включены.\n\n"
-        "Чтобы добавить описание: открой альбом → нажми ✏️ Изменить описание → пришли текст.\n"
+        "Описание: открой альбом → ✏️ Изменить описание → пришли текст.\n"
+        "Ссылка: открой альбом → 🔗 Изменить ссылку → пришли song.link / album.link / odesli.co.\n"
+        "Обложка: открой альбом → 🖼 Изменить обложку → пришли прямую ссылку на картинку.\n"
         f"Лимит описания: {DESCRIPTION_MAX_LEN} символов.\n"
-        "Удалить описание можно сообщением: -"
+        "Удалить описание/ссылку/обложку можно сообщением: -"
     )
 
 @router.message(Command("stats"))
@@ -2510,6 +2517,145 @@ async def pending_text_handler(message: Message):
             return
 
         await message.answer(res["text"], parse_mode="HTML", reply_markup=res["kb"])
+        return
+
+
+    if mode == "album_link":
+        payload_raw = ui.get("payload") or ""
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except Exception:
+            payload = {}
+        album_list = payload.get("album_list")
+        rank = payload.get("rank")
+        ctx = payload.get("ctx") or "flow"
+        chat_id = payload.get("chat_id") or message.chat.id
+        message_id = payload.get("message_id")
+        is_photo = bool(payload.get("is_photo"))
+
+        if not is_admin(message.from_user.id):
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("У тебя нет прав менять публичные ссылки.")
+            return
+
+        txt = (message.text or "").strip()
+        if not album_list or not rank:
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Не смог понять, к какому альбому относится ссылка. Попробуй ещё раз с кнопки.")
+            return
+
+        if txt in ("-", "—", "удалить", "delete", "del"):
+            await delete_cached_songlink(album_list, int(rank))
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Удалил ручную ссылку. Бот снова попробует подобрать ссылку сам.", reply_markup=menu_keyboard())
+        else:
+            if not _is_songlink_url(txt):
+                await message.answer(
+                    "Ссылка должна быть song.link, album.link или odesli.co и начинаться с http(s).\n"
+                    "Пришли другую ссылку или /cancel."
+                )
+                return
+            await set_cached_songlink(album_list, int(rank), txt)
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Сохранил ссылку на альбом.", reply_markup=menu_keyboard())
+
+        try:
+            if message_id:
+                df = get_albums(album_list)
+                rows = df.loc[df["rank"] == int(rank)]
+                if not rows.empty:
+                    row = rows.iloc[0]
+                    artist = str(row["artist"])
+                    album = str(row["album"])
+                    genre = str(row.get("genre", "") or "")
+                    ur = await get_user_rating(message.from_user.id, album_list, int(rank))
+                    in_rel = await is_relisten(message.from_user.id, album_list, int(rank))
+                    rev = await get_user_review(message.from_user.id, album_list, int(rank))
+                    desc = await get_album_description(album_list, int(rank))
+                    caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev, description=desc)
+                    listen_url = await get_songlink_url(album_list, int(rank), artist, album)
+                    is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
+                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav, viewer_user_id=message.from_user.id)
+                    if is_photo:
+                        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+                    else:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=caption, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            log.debug("link refresh edit failed: %s", e)
+        return
+
+    if mode == "album_cover":
+        payload_raw = ui.get("payload") or ""
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except Exception:
+            payload = {}
+        album_list = payload.get("album_list")
+        rank = payload.get("rank")
+        ctx = payload.get("ctx") or "flow"
+        chat_id = payload.get("chat_id") or message.chat.id
+        message_id = payload.get("message_id")
+        is_photo = bool(payload.get("is_photo"))
+
+        if not is_admin(message.from_user.id):
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("У тебя нет прав менять публичные обложки.")
+            return
+
+        txt = (message.text or "").strip()
+        if not album_list or not rank:
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Не смог понять, к какому альбому относится обложка. Попробуй ещё раз с кнопки.")
+            return
+
+        new_cover_url = None
+        if txt in ("-", "—", "удалить", "delete", "del"):
+            await delete_cached_cover(album_list, int(rank))
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Удалил ручную обложку. Бот снова попробует подобрать её сам.", reply_markup=menu_keyboard())
+        else:
+            await init_http()
+            if not await _is_image_url(txt):
+                await message.answer(
+                    "Ссылка не выглядит как прямая картинка. Нужен URL, который открывает сам файл изображения.\n"
+                    "Пришли другую ссылку или /cancel."
+                )
+                return
+            await set_cached_cover(album_list, int(rank), txt, "manual")
+            new_cover_url = txt
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("Ок. Сохранил обложку альбома.", reply_markup=menu_keyboard())
+
+        try:
+            if message_id:
+                df = get_albums(album_list)
+                rows = df.loc[df["rank"] == int(rank)]
+                if not rows.empty:
+                    row = rows.iloc[0]
+                    artist = str(row["artist"])
+                    album = str(row["album"])
+                    genre = str(row.get("genre", "") or "")
+                    ur = await get_user_rating(message.from_user.id, album_list, int(rank))
+                    in_rel = await is_relisten(message.from_user.id, album_list, int(rank))
+                    rev = await get_user_review(message.from_user.id, album_list, int(rank))
+                    desc = await get_album_description(album_list, int(rank))
+                    caption = album_caption(int(rank), artist, album, genre, ur, in_relisten=in_rel, review=rev, description=desc)
+                    listen_url = await get_songlink_url(album_list, int(rank), artist, album)
+                    is_fav = await is_favorite(message.from_user.id, album_list, int(rank))
+                    kb = album_keyboard(album_list, int(rank), artist, album, ur, ctx, listen_url, in_relisten=in_rel, is_fav=is_fav, viewer_user_id=message.from_user.id)
+                    if is_photo and new_cover_url:
+                        await bot.edit_message_media(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            media=InputMediaPhoto(media=new_cover_url, caption=caption, parse_mode="HTML"),
+                            reply_markup=kb,
+                        )
+                    elif is_photo:
+                        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+                    else:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=caption, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            log.debug("cover refresh edit failed: %s", e)
         return
 
     if mode == "album_desc":
@@ -3078,6 +3224,83 @@ async def description_ui(call: CallbackQuery):
 
     await call.answer()
     await call.message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("ui:link_edit:"))
+async def link_edit_ui(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Только для админа", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    if len(parts) != 5:
+        await call.answer("Ошибка кнопки", show_alert=True)
+        return
+    enc = parts[2]
+    album_list = canonical_list_name(enc)
+    album_list = resolve_list_name(album_list) or album_list
+    rank = int(parts[3])
+    ctx = parts[4]
+
+    payload = json.dumps({
+        "album_list": album_list,
+        "rank": rank,
+        "ctx": ctx,
+        "chat_id": call.message.chat.id if call.message else call.from_user.id,
+        "message_id": call.message.message_id if call.message else None,
+        "is_photo": bool(call.message.photo) if call.message else False,
+    }, ensure_ascii=False)
+    await db_set_user_input(call.from_user.id, "album_link", payload)
+
+    cur = await get_cached_songlink(album_list, rank)
+    cur_txt = f"\n\nТекущая ссылка:\n{html.escape(cur)}" if cur else ""
+    await call.answer()
+    await call.message.answer(
+        "🔗 Пришли новую ссылку на альбом одним сообщением.\n"
+        "Подойдут song.link, album.link или odesli.co.\n"
+        "Удалить ручную ссылку: отправь минус '-'\n"
+        "Отмена: /cancel"
+        + cur_txt,
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("ui:cover_edit:"))
+async def cover_edit_ui(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Только для админа", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    if len(parts) != 5:
+        await call.answer("Ошибка кнопки", show_alert=True)
+        return
+    enc = parts[2]
+    album_list = canonical_list_name(enc)
+    album_list = resolve_list_name(album_list) or album_list
+    rank = int(parts[3])
+    ctx = parts[4]
+
+    payload = json.dumps({
+        "album_list": album_list,
+        "rank": rank,
+        "ctx": ctx,
+        "chat_id": call.message.chat.id if call.message else call.from_user.id,
+        "message_id": call.message.message_id if call.message else None,
+        "is_photo": bool(call.message.photo) if call.message else False,
+    }, ensure_ascii=False)
+    await db_set_user_input(call.from_user.id, "album_cover", payload)
+
+    cur = await get_cached_cover(album_list, rank)
+    cur_txt = f"\n\nТекущая обложка:\n{html.escape(cur)}" if cur else ""
+    await call.answer()
+    await call.message.answer(
+        "🖼 Пришли прямую ссылку на новую обложку одним сообщением.\n"
+        "Нужна именно ссылка на файл картинки, чтобы сервер отдавал image/*.\n"
+        "Удалить ручную обложку: отправь минус '-'\n"
+        "Отмена: /cancel"
+        + cur_txt,
+        parse_mode="HTML"
+    )
 
 @router.callback_query(F.data.startswith("ui:desc_edit:"))
 async def description_edit_ui(call: CallbackQuery):
