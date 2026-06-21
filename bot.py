@@ -1640,14 +1640,23 @@ async def send_relisten_list(user_id: int, limit: int = 200, album_list: Optiona
 
     await send_html_chunks(user_id, "\n".join(lines), reply_markup=relisten_keyboard())
 
-async def send_random_relisten(user_id: int) -> None:
+async def send_random_relisten(user_id: int, album_list: Optional[str] = None) -> None:
     async with _pool().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT album_list, rank FROM relisten WHERE user_id=$1 ORDER BY random() LIMIT 1",
-            user_id
-        )
+        if album_list:
+            row = await conn.fetchrow(
+                "SELECT album_list, rank FROM relisten WHERE user_id=$1 AND album_list=$2 ORDER BY random() LIMIT 1",
+                user_id, album_list
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT album_list, rank FROM relisten WHERE user_id=$1 ORDER BY random() LIMIT 1",
+                user_id
+            )
     if not row:
-        await bot.send_message(user_id, "🔁 Список «на переслушать» пуст.", reply_markup=relisten_keyboard())
+        if album_list:
+            await bot.send_message(user_id, f"🔁 В текущем списке <b>{html.escape(album_list)}</b> пока нет альбомов на переслушать.", parse_mode="HTML", reply_markup=relisten_keyboard())
+        else:
+            await bot.send_message(user_id, "🔁 Список «на переслушать» пуст.", reply_markup=relisten_keyboard())
         return
 
     lst = row["album_list"]
@@ -1754,9 +1763,8 @@ def stats_plus_keyboard() -> InlineKeyboardMarkup:
 
 def relisten_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎲 Случайный", callback_data="ui:relisten_random")],
-        [InlineKeyboardButton(text="📃 Показать все вместе", callback_data="ui:relisten_list")],
-        [InlineKeyboardButton(text="📂 Выбрать список", callback_data="ui:relisten_by_list")],
+        [InlineKeyboardButton(text="🎲 Случайный из текущего списка", callback_data="ui:relisten_random")],
+        [InlineKeyboardButton(text="📃 Переслушать в текущем списке", callback_data="ui:relisten_list")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="ui:menu")],
     ])
 
@@ -1961,8 +1969,8 @@ async def format_top_bottom(user_id: int, album_list: str, *, top: bool, limit: 
     По новой логике: лучшие = оценки 1 и 2, худшие = оценка 5.
     """
     if top:
-        return await format_ratings_bucket(user_id, album_list, [1, 2], "🏆 <b>Лучшие альбомы</b>")
-    return await format_ratings_bucket(user_id, album_list, [5], "🧨 <b>Худшие альбомы</b>")
+        return await format_ratings_bucket(user_id, album_list, [5], "🏆 <b>Лучшие альбомы</b>")
+    return await format_ratings_bucket(user_id, album_list, [1, 2], "🧨 <b>Худшие альбомы</b>")
 
 async def format_recent_ratings(user_id: int, limit: int = 10) -> str:
     tz = ZoneInfo(Config.DAILY_TZ)
@@ -2364,19 +2372,27 @@ async def cmd_insights(msg: Message):
 
 @router.message(Command("relisten"))
 async def cmd_relisten(msg: Message):
-    items = await get_relisten_items(msg.from_user.id, limit=1)
-    count = 0
+    album_list = await get_selected_list(msg.from_user.id)
     async with _pool().acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM relisten WHERE user_id=$1", msg.from_user.id)
-    await msg.answer(f"🔁 <b>На переслушать</b>\n\nВсего: <b>{count}</b>", parse_mode="HTML", reply_markup=relisten_keyboard())
+        count = await conn.fetchval("SELECT COUNT(*) FROM relisten WHERE user_id=$1 AND album_list=$2", msg.from_user.id, album_list)
+    await msg.answer(
+        f"🔁 <b>На переслушать</b>\n\n"
+        f"Текущий список: <b>{html.escape(album_list)}</b>\n"
+        f"Всего в этом списке: <b>{count}</b>",
+        parse_mode="HTML",
+        reply_markup=relisten_keyboard(),
+    )
+
 
 @router.message(Command("relisten_random"))
 async def cmd_relisten_random(msg: Message):
-    await send_random_relisten(msg.from_user.id)
+    album_list = await get_selected_list(msg.from_user.id)
+    await send_random_relisten(msg.from_user.id, album_list=album_list)
 
 @router.message(Command("relisten_list"))
 async def cmd_relisten_list(msg: Message):
-    await send_relisten_list(msg.from_user.id)
+    album_list = await get_selected_list(msg.from_user.id)
+    await send_relisten_list(msg.from_user.id, album_list=album_list)
 
 
 
@@ -3119,9 +3135,8 @@ async def ui_find_artist_cb(call: CallbackQuery):
 
 def favorites_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎲 Рандом", callback_data="ui:favorites_random")],
-        [InlineKeyboardButton(text="📜 Показать все вместе", callback_data="ui:favorites_list")],
-        [InlineKeyboardButton(text="📂 Выбрать список", callback_data="ui:favorites_by_list")],
+        [InlineKeyboardButton(text="🎲 Рандом из текущего списка", callback_data="ui:favorites_random")],
+        [InlineKeyboardButton(text="📜 Любимые в текущем списке", callback_data="ui:favorites_list")],
         [InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")],
     ])
 
@@ -3135,19 +3150,22 @@ def favorites_list_choice_keyboard(rows: list[tuple[str, int]]) -> InlineKeyboar
 @router.callback_query(F.data == "ui:favorites")
 async def ui_favorites_cb(call: CallbackQuery):
     await call.answer()
+    album_list = await get_selected_list(call.from_user.id)
     await call.message.answer(
-        "❤️ Любимые\n\n"
-        "Тут твои отмеченные альбомы.\n"
-        "Rank можно открыть командой /go 77.",
+        f"❤️ Любимые\n\n"
+        f"Сейчас показываю любимые из текущего списка: <b>{html.escape(album_list)}</b>.\n"
+        f"Rank можно открыть командой /go 77.",
+        parse_mode="HTML",
         reply_markup=favorites_keyboard(),
     )
 
 @router.callback_query(F.data == "ui:favorites_random")
 async def ui_favorites_random_cb(call: CallbackQuery):
     await call.answer()
-    pick = await random_favorite(call.from_user.id)
+    current_list = await get_selected_list(call.from_user.id)
+    pick = await random_favorite(call.from_user.id, album_list=current_list)
     if not pick:
-        await call.message.answer("❤️ Любимых пока нет.")
+        await call.message.answer(f"❤️ В текущем списке <b>{html.escape(current_list)}</b> любимых пока нет.", parse_mode="HTML")
         return
     album_list, rank = pick
     idx = find_index_by_rank(album_list, rank)
@@ -3186,7 +3204,8 @@ async def send_favorites_list(user_id: int, album_list: Optional[str] = None, li
 @router.callback_query(F.data == "ui:favorites_list")
 async def ui_favorites_list_cb(call: CallbackQuery):
     await call.answer()
-    await send_favorites_list(call.from_user.id, limit=200)
+    album_list = await get_selected_list(call.from_user.id)
+    await send_favorites_list(call.from_user.id, album_list=album_list, limit=200)
 
 @router.callback_query(F.data == "ui:favorites_by_list")
 async def ui_favorites_by_list_cb(call: CallbackQuery):
@@ -3220,7 +3239,7 @@ async def stats_plus_cb(call: CallbackQuery):
 @router.callback_query(lambda c: c.data in {"ui:best_albums", "ui:top"})
 async def best_albums_cb(call: CallbackQuery):
     album_list = await get_selected_list(call.from_user.id)
-    txt = await format_ratings_bucket(call.from_user.id, album_list, [1, 2], "🏆 <b>Лучшие альбомы</b>")
+    txt = await format_ratings_bucket(call.from_user.id, album_list, [5], "🏆 <b>Лучшие альбомы</b>")
     await call.answer()
     await send_html_chunks(call.from_user.id, txt, reply_markup=menu_keyboard())
 
@@ -3234,7 +3253,7 @@ async def ok_albums_cb(call: CallbackQuery):
 @router.callback_query(lambda c: c.data in {"ui:worst_albums", "ui:bottom"})
 async def worst_albums_cb(call: CallbackQuery):
     album_list = await get_selected_list(call.from_user.id)
-    txt = await format_ratings_bucket(call.from_user.id, album_list, [5], "🧨 <b>Худшие альбомы</b>")
+    txt = await format_ratings_bucket(call.from_user.id, album_list, [1, 2], "🧨 <b>Худшие альбомы</b>")
     await call.answer()
     await send_html_chunks(call.from_user.id, txt, reply_markup=menu_keyboard())
 
@@ -3259,11 +3278,14 @@ async def insights_cb(call: CallbackQuery):
 
 @router.callback_query(F.data == "ui:relisten_menu")
 async def relisten_menu_cb(call: CallbackQuery):
+    album_list = await get_selected_list(call.from_user.id)
     async with _pool().acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM relisten WHERE user_id=$1", call.from_user.id)
+        count = await conn.fetchval("SELECT COUNT(*) FROM relisten WHERE user_id=$1 AND album_list=$2", call.from_user.id, album_list)
     await call.answer()
     await call.message.answer(
-        f"🔁 <b>На переслушать</b>\n\nВсего: <b>{count}</b>",
+        f"🔁 <b>На переслушать</b>\n\n"
+        f"Текущий список: <b>{html.escape(album_list)}</b>\n"
+        f"Всего в этом списке: <b>{count}</b>",
         parse_mode="HTML",
         reply_markup=relisten_keyboard()
     )
@@ -3271,12 +3293,14 @@ async def relisten_menu_cb(call: CallbackQuery):
 @router.callback_query(F.data == "ui:relisten_random")
 async def relisten_random_cb(call: CallbackQuery):
     await call.answer()
-    await send_random_relisten(call.from_user.id)
+    album_list = await get_selected_list(call.from_user.id)
+    await send_random_relisten(call.from_user.id, album_list=album_list)
 
 @router.callback_query(F.data == "ui:relisten_list")
 async def relisten_list_cb(call: CallbackQuery):
     await call.answer()
-    await send_relisten_list(call.from_user.id)
+    album_list = await get_selected_list(call.from_user.id)
+    await send_relisten_list(call.from_user.id, album_list=album_list)
 
 @router.callback_query(F.data == "ui:relisten_by_list")
 async def relisten_by_list_cb(call: CallbackQuery):
@@ -3802,18 +3826,21 @@ async def ai_generate(call: CallbackQuery):
 
 @router.message(Command("favorites"))
 async def cmd_favorites(message: Message):
-    await send_favorites_list(message.from_user.id, limit=200)
+    album_list = await get_selected_list(message.from_user.id)
+    await send_favorites_list(message.from_user.id, album_list=album_list, limit=200)
 
 @router.message(Command("rand_favorite"))
 async def cmd_rand_favorite(message: Message):
-    item = await random_favorite(message.from_user.id)
+    current_list = await get_selected_list(message.from_user.id)
+    item = await random_favorite(message.from_user.id, album_list=current_list)
     if not item:
-        await message.answer("Любимых альбомов пока нет.")
+        await message.answer(f"В текущем списке <b>{html.escape(current_list)}</b> любимых альбомов пока нет.", parse_mode="HTML")
         return
     lst, rk = item
     await set_selected_list(message.from_user.id, lst)
     await set_progress(message.from_user.id, lst, rk)
     await send_album_post(message.from_user.id, lst)
+
 
 @router.message(Command("version"))
 async def cmd_version(msg: Message):
