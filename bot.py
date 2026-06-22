@@ -1975,6 +1975,60 @@ async def relisten_list_counts(user_id: int) -> list[tuple[str, int]]:
         )
     return [(r["album_list"], int(r["c"])) for r in rows]
 
+
+
+def _clean_album_field(value: Any) -> str:
+    """Safe text for optional album metadata fields from xlsx rows."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s
+
+
+def _row_first_value(row: Any, names: list[str]) -> str:
+    """Get first existing non-empty field from a pandas row/Series."""
+    for name in names:
+        try:
+            if name in row.index:
+                v = _clean_album_field(row.get(name))
+                if v:
+                    return v
+        except Exception:
+            pass
+    return ""
+
+
+def format_album_list_item(rank: int, row: Any) -> str:
+    """Format list rows as: #rank — Artist — Album — Year, Genre."""
+    artist = html.escape(_row_first_value(row, ["artist", "Artist", "исполнитель", "Исполнитель"]))
+    album = html.escape(_row_first_value(row, ["album", "Album", "альбом", "Альбом"]))
+    year = _row_first_value(row, ["year", "Year", "год", "Год"])
+    genre = _row_first_value(row, ["genre", "Genre", "жанр", "Жанр"])
+
+    meta_parts = []
+    if year:
+        meta_parts.append(html.escape(year))
+    if genre:
+        meta_parts.append(html.escape(genre))
+    meta = f" — {', '.join(meta_parts)}" if meta_parts else ""
+
+    if artist and album:
+        return f"#{int(rank)} — {artist} — {album}{meta}"
+    if artist:
+        return f"#{int(rank)} — {artist}{meta}"
+    if album:
+        return f"#{int(rank)} — {album}{meta}"
+    return f"#{int(rank)}{meta}"
+
 async def send_html_chunks(user_id: int, text: str, *, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     max_len = 3800
     lines = text.split("\n")
@@ -2020,11 +2074,9 @@ async def send_relisten_list(user_id: int, limit: int = 200, album_list: Optiona
         except Exception:
             df = None
         if df is not None and rank in df.index:
-            artist = html.escape(str(df.loc[rank]["artist"]))
-            album = html.escape(str(df.loc[rank]["album"]))
-            lines.append(f"{i}. {html.escape(lst)} #{rank} — {artist} — {album}")
+            lines.append(f"{i}. {format_album_list_item(rank, df.loc[rank])}")
         else:
-            lines.append(f"{i}. {html.escape(lst)} #{rank}")
+            lines.append(f"{i}. #{rank}")
 
     await send_html_chunks(user_id, "\n".join(lines), reply_markup=relisten_keyboard())
 
@@ -3684,13 +3736,14 @@ async def send_favorites_list(user_id: int, album_list: Optional[str] = None, li
         "",
     ]
     for i, (lst, rank) in enumerate(rows, 1):
-        info = await _album_by_rank(lst, rank)
-        if info:
-            artist = html.escape(str(info.get("artist", "")).strip())
-            album = html.escape(str(info.get("album", "")).strip())
-            lines_out.append(f"{i}. #{rank} — {artist} — {album}. {html.escape(lst)}")
+        try:
+            df = get_albums(lst).set_index("rank")
+        except Exception:
+            df = None
+        if df is not None and int(rank) in df.index:
+            lines_out.append(f"{i}. {format_album_list_item(int(rank), df.loc[int(rank)])}")
         else:
-            lines_out.append(f"{i}. #{rank}. {html.escape(lst)}")
+            lines_out.append(f"{i}. #{int(rank)}")
 
     await send_html_chunks(user_id, "\n".join(lines_out), reply_markup=favorites_keyboard())
 
