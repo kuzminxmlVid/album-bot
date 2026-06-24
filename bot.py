@@ -10,7 +10,7 @@ import random
 import hashlib
 from pathlib import Path
 
-BOT_VERSION = os.getenv("BOT_VERSION", "v63-2026-06-21_auto-messages")
+BOT_VERSION = os.getenv("BOT_VERSION", "v64-2026-06-21_admin-controlled-auto-message")
 AI_CACHE_VERSION = 6  # bump to invalidate old AI cache
 from typing import Any, Optional, Dict, List
 from urllib.parse import quote_plus, quote, unquote_plus
@@ -94,6 +94,155 @@ ACTION_TYPE_LABELS = {
     "command": "команды",
     "other": "другие действия",
 }
+
+
+
+# Админское автосообщение. Старые ежедневные напоминания и вечерние сводки больше не отправляются сами.
+AUTO_MESSAGE_TEXT_MAX_LEN = 3500
+
+
+def admin_auto_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅/⛔ Включить или выключить", callback_data="admin_auto:toggle")],
+        [InlineKeyboardButton(text="🕒 Изменить время", callback_data="admin_auto:set_time")],
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="admin_auto:set_text")],
+        [InlineKeyboardButton(text="🖼🎧 Прикрепить фото или аудио", callback_data="admin_auto:set_media")],
+        [InlineKeyboardButton(text="🧹 Убрать вложение", callback_data="admin_auto:clear_media")],
+        [InlineKeyboardButton(text="👀 Тест себе", callback_data="admin_auto:test")],
+        [InlineKeyboardButton(text="🚀 Отправить сейчас всем", callback_data="admin_auto:send_now")],
+        [InlineKeyboardButton(text="📋 Меню", callback_data="ui:menu")],
+    ])
+
+
+async def get_admin_auto_settings() -> dict:
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM admin_auto_message WHERE id=1")
+        if not row:
+            await conn.execute(
+                "INSERT INTO admin_auto_message (id, is_enabled, send_hour, send_minute, message_text) VALUES (1,FALSE,12,0,'')"
+            )
+            row = await conn.fetchrow("SELECT * FROM admin_auto_message WHERE id=1")
+    return dict(row) if row else {}
+
+
+async def update_admin_auto_settings(**kwargs) -> None:
+    allowed = {"is_enabled", "send_hour", "send_minute", "message_text", "media_type", "media_file_id", "updated_by", "last_sent_at"}
+    keys = [k for k in kwargs.keys() if k in allowed]
+    if not keys:
+        return
+    sets = []
+    vals = []
+    for i, k in enumerate(keys, start=1):
+        sets.append(f"{k}=${i}")
+        vals.append(kwargs[k])
+    sets.append("updated_at=NOW()")
+    async with _pool().acquire() as conn:
+        await conn.execute(f"UPDATE admin_auto_message SET {', '.join(sets)} WHERE id=1", *vals)
+
+
+def _admin_auto_time_text(settings: dict) -> str:
+    h = int(settings.get("send_hour") or 0)
+    m = int(settings.get("send_minute") or 0)
+    return f"{h:02d}:{m:02d}"
+
+
+def _admin_auto_media_text(settings: dict) -> str:
+    mt = (settings.get("media_type") or "").strip()
+    if mt == "photo":
+        return "фото"
+    if mt == "audio":
+        return "аудио"
+    if mt == "voice":
+        return "голосовое"
+    return "нет"
+
+
+async def build_admin_auto_text() -> str:
+    s = await get_admin_auto_settings()
+    enabled = "включено" if bool(s.get("is_enabled")) else "выключено"
+    txt = str(s.get("message_text") or "").strip()
+    preview = html.escape(txt[:900]) if txt else "—"
+    if len(txt) > 900:
+        preview += "…"
+    last_sent = s.get("last_sent_at")
+    last_txt = "—"
+    if last_sent:
+        try:
+            last_txt = last_sent.astimezone(ZoneInfo(Config.DAILY_TZ)).strftime("%d.%m %H:%M")
+        except Exception:
+            last_txt = str(last_sent)
+    return (
+        "📣 <b>Автосообщение админа</b>\n\n"
+        f"Статус: <b>{enabled}</b>\n"
+        f"Время отправки: <b>{_admin_auto_time_text(s)}</b> ({html.escape(Config.DAILY_TZ)})\n"
+        f"Вложение: <b>{_admin_auto_media_text(s)}</b>\n"
+        f"Последняя отправка: <b>{html.escape(last_txt)}</b>\n\n"
+        "Текст:\n"
+        f"{preview}\n\n"
+        "Как это работает: сообщение отправляется всем пользователям один раз, когда наступит выбранное время. "
+        "После отправки оно автоматически выключается, чтобы не спамить людей."
+    )
+
+
+async def send_admin_auto_to_user(user_id: int, settings: dict, *, disable_notification: bool = False) -> None:
+    txt = str(settings.get("message_text") or "").strip()
+    mt = (settings.get("media_type") or "").strip()
+    fid = (settings.get("media_file_id") or "").strip()
+    if not txt and not fid:
+        return
+    if mt == "photo" and fid:
+        await bot.send_photo(int(user_id), fid, caption=txt or None, parse_mode="HTML" if txt else None, disable_notification=disable_notification)
+    elif mt == "audio" and fid:
+        await bot.send_audio(int(user_id), fid, caption=txt or None, parse_mode="HTML" if txt else None, disable_notification=disable_notification)
+    elif mt == "voice" and fid:
+        await bot.send_voice(int(user_id), fid, caption=txt or None, parse_mode="HTML" if txt else None, disable_notification=disable_notification)
+    else:
+        await bot.send_message(int(user_id), txt, parse_mode="HTML", disable_notification=disable_notification, disable_web_page_preview=True)
+
+
+async def send_admin_auto_to_all(settings: dict) -> tuple[int, int]:
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+    ok = 0
+    fail = 0
+    for r in rows:
+        user_id = int(r["user_id"])
+        try:
+            await send_admin_auto_to_user(user_id, settings)
+            ok += 1
+            await asyncio.sleep(0.035)
+        except Exception as e:
+            fail += 1
+            log.debug("admin auto send failed user=%s: %s", user_id, e)
+    return ok, fail
+
+
+async def send_admin_auto_broadcast_if_needed() -> None:
+    s = await get_admin_auto_settings()
+    if not bool(s.get("is_enabled")):
+        return
+    if not str(s.get("message_text") or "").strip() and not str(s.get("media_file_id") or "").strip():
+        return
+    tz = ZoneInfo(Config.DAILY_TZ)
+    now = datetime.now(tz)
+    send_h = int(s.get("send_hour") or 0)
+    send_m = int(s.get("send_minute") or 0)
+    if (now.hour, now.minute) < (send_h, send_m):
+        return
+    last_sent = s.get("last_sent_at")
+    if last_sent:
+        try:
+            if last_sent.astimezone(tz).date() == now.date():
+                return
+        except Exception:
+            pass
+    ok, fail = await send_admin_auto_to_all(s)
+    await update_admin_auto_settings(is_enabled=False, last_sent_at=datetime.now(timezone.utc))
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"📣 Автосообщение отправлено. Успешно: {ok}, ошибок: {fail}. Автоотправка выключена.")
+        except Exception:
+            pass
 
 
 def _daily_random_minute(user_id: int, local_day: date) -> int:
@@ -305,15 +454,7 @@ async def send_end_of_day_summary_if_needed(user_id: int) -> None:
 async def auto_messages_loop() -> None:
     while True:
         try:
-            async with _pool().acquire() as conn:
-                users = await conn.fetch("SELECT user_id FROM users")
-            for row in users:
-                user_id = int(row["user_id"])
-                try:
-                    await send_inactivity_reminder_if_needed(user_id)
-                    await send_end_of_day_summary_if_needed(user_id)
-                except Exception as e:
-                    log.debug("auto messages failed for user=%s: %s", user_id, e)
+            await send_admin_auto_broadcast_if_needed()
             await asyncio.sleep(60)
         except asyncio.CancelledError:
             return
@@ -696,6 +837,27 @@ async def init_pg() -> None:
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (user_id, album_list)
         )
+        """)
+
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_auto_message (
+            id INTEGER PRIMARY KEY,
+            is_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            send_hour INTEGER NOT NULL DEFAULT 12,
+            send_minute INTEGER NOT NULL DEFAULT 0,
+            message_text TEXT NOT NULL DEFAULT '',
+            media_type TEXT,
+            media_file_id TEXT,
+            updated_by BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_sent_at TIMESTAMPTZ
+        )
+        """)
+        await conn.execute("""
+        INSERT INTO admin_auto_message (id, is_enabled, send_hour, send_minute, message_text)
+        VALUES (1, FALSE, 12, 0, '')
+        ON CONFLICT (id) DO NOTHING
         """)
 
 # ================= LIST NAMES =================
@@ -2191,6 +2353,12 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📚 Списки", callback_data="ui:lists")],
     ])
 
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = list(menu_keyboard().inline_keyboard)
+    rows.insert(1, [InlineKeyboardButton(text="📣 Автосообщение", callback_data="admin_auto:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def stats_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏆 Лучшие альбомы", callback_data="ui:best_albums")],
@@ -2822,7 +2990,7 @@ def _parse_del_songlink_args(text: str) -> tuple[Optional[str], Optional[int]]:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message):
     await db_clear_user_input(message.from_user.id)
-    await message.answer("Окей, отменил.", reply_markup=menu_keyboard())
+    await message.answer("Окей, отменил.", reply_markup=admin_menu_keyboard() if is_admin(message.from_user.id) else menu_keyboard())
 
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
@@ -2839,7 +3007,7 @@ async def cmd_start(msg: Message):
         "Общая статистика: /stats\n"
         "Альбом из другого списка: /next_from <название>\n"
     )
-    await msg.answer(text, reply_markup=menu_keyboard())
+    await msg.answer(text, reply_markup=admin_menu_keyboard() if is_admin(msg.from_user.id) else menu_keyboard())
 
 @router.message(Command("start_albums"))
 async def cmd_start_albums(msg: Message):
@@ -2856,7 +3024,7 @@ async def cmd_start_albums(msg: Message):
 
 @router.message(Command("menu"))
 async def cmd_menu(msg: Message):
-    await msg.answer("📋 Меню", reply_markup=menu_keyboard())
+    await msg.answer("📋 Меню", reply_markup=admin_menu_keyboard() if is_admin(msg.from_user.id) else menu_keyboard())
 
 @router.message(Command("myid"))
 async def cmd_myid(msg: Message):
@@ -2884,6 +3052,16 @@ async def cmd_admin(msg: Message):
         "Удалить описание/ссылку/обложку можно сообщением: -"
     )
 
+
+
+@router.message(Command("admin_auto"))
+async def cmd_admin_auto(msg: Message):
+    if not is_admin(msg.from_user.id):
+        await msg.answer("У тебя нет прав на админскую рассылку.")
+        return
+    txt = await build_admin_auto_text()
+    await msg.answer(txt, parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
     txt = await build_stats_text(msg.from_user.id)
@@ -2902,7 +3080,8 @@ async def cmd_bottom(msg: Message):
 
 @router.message(Command("recent_ratings"))
 async def cmd_recent_ratings(msg: Message):
-    txt = await format_recent_ratings(msg.from_user.id, limit=10)
+    album_list = await get_selected_list(msg.from_user.id)
+    txt = await format_recent_ratings(msg.from_user.id, album_list, limit=10)
     await msg.answer(txt, parse_mode="HTML", reply_markup=stats_keyboard(), disable_web_page_preview=True)
 
 @router.message(Command("streak"))
@@ -3179,6 +3358,36 @@ async def cmd_go(msg: Message):
 
 
 
+
+
+@router.message(F.photo | F.audio | F.voice)
+async def pending_media_handler(message: Message):
+    ui = await db_get_user_input(message.from_user.id)
+    if not ui or ui.get("mode") != "admin_auto_media":
+        return
+    if not is_admin(message.from_user.id):
+        await db_clear_user_input(message.from_user.id)
+        await message.answer("У тебя нет прав менять автосообщение.")
+        return
+    media_type = None
+    file_id = None
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.audio:
+        media_type = "audio"
+        file_id = message.audio.file_id
+    elif message.voice:
+        media_type = "voice"
+        file_id = message.voice.file_id
+    if not media_type or not file_id:
+        await message.answer("Не смог прочитать вложение. Пришли фото, аудио или голосовое, или /cancel.")
+        return
+    await update_admin_auto_settings(media_type=media_type, media_file_id=file_id, updated_by=message.from_user.id)
+    await db_clear_user_input(message.from_user.id)
+    await message.answer("Ок. Вложение сохранено.", reply_markup=admin_auto_keyboard())
+    await message.answer(await build_admin_auto_text(), parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def pending_text_handler(message: Message):
     ui = await db_get_user_input(message.from_user.id)
@@ -3186,6 +3395,42 @@ async def pending_text_handler(message: Message):
         return
 
     mode = ui.get("mode")
+
+
+    if mode == "admin_auto_time":
+        if not is_admin(message.from_user.id):
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("У тебя нет прав менять автосообщение.")
+            return
+        txt = (message.text or "").strip()
+        m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", txt)
+        if not m:
+            await message.answer("Не понял время. Пришли в формате HH:MM, например 13:30, или /cancel.")
+            return
+        h = int(m.group(1))
+        minute = int(m.group(2))
+        await update_admin_auto_settings(send_hour=h, send_minute=minute, updated_by=message.from_user.id)
+        await db_clear_user_input(message.from_user.id)
+        await message.answer("Ок. Время обновлено.", reply_markup=admin_auto_keyboard())
+        await message.answer(await build_admin_auto_text(), parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+        return
+
+    if mode == "admin_auto_text":
+        if not is_admin(message.from_user.id):
+            await db_clear_user_input(message.from_user.id)
+            await message.answer("У тебя нет прав менять автосообщение.")
+            return
+        txt = (message.text or "").strip()
+        if txt in ("-", "—", "удалить", "delete", "del"):
+            txt = ""
+        if len(txt) > AUTO_MESSAGE_TEXT_MAX_LEN:
+            await message.answer(f"Текст слишком длинный: {len(txt)} символов. Максимум: {AUTO_MESSAGE_TEXT_MAX_LEN}. Пришли короче или /cancel.")
+            return
+        await update_admin_auto_settings(message_text=txt, updated_by=message.from_user.id)
+        await db_clear_user_input(message.from_user.id)
+        await message.answer("Ок. Текст автосообщения обновлён.", reply_markup=admin_auto_keyboard())
+        await message.answer(await build_admin_auto_text(), parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+        return
 
     if mode == "find_artist":
         needle = (message.text or "").strip()
@@ -3663,7 +3908,7 @@ async def nav_cb(call: CallbackQuery):
 @router.callback_query(F.data == "ui:menu")
 async def menu_cb(call: CallbackQuery):
     await call.answer()
-    await call.message.answer("📋 Меню", reply_markup=menu_keyboard())
+    await call.message.answer("📋 Меню", reply_markup=admin_menu_keyboard() if is_admin(call.from_user.id) else menu_keyboard())
 
 
 @router.callback_query(F.data == "ui:find_artist")
@@ -4601,6 +4846,105 @@ async def fav_toggle(call: CallbackQuery):
         log.debug("fav toggle edit markup failed: %s", e)
 
 
+
+
+
+
+@router.callback_query(F.data == "admin_auto:panel")
+async def admin_auto_panel_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    txt = await build_admin_auto_text()
+    await call.answer()
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "admin_auto:toggle")
+async def admin_auto_toggle_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    s = await get_admin_auto_settings()
+    new_state = not bool(s.get("is_enabled"))
+    await update_admin_auto_settings(is_enabled=new_state, updated_by=call.from_user.id)
+    await call.answer("Включено" if new_state else "Выключено")
+    txt = await build_admin_auto_text()
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "admin_auto:set_time")
+async def admin_auto_set_time_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    await db_set_user_input(call.from_user.id, "admin_auto_time")
+    await call.answer()
+    await call.message.answer("Пришли время отправки в формате <b>HH:MM</b>. Например: <code>13:30</code>\nТаймзона: " + html.escape(Config.DAILY_TZ), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "admin_auto:set_text")
+async def admin_auto_set_text_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    await db_set_user_input(call.from_user.id, "admin_auto_text")
+    await call.answer()
+    await call.message.answer(
+        f"Пришли текст автосообщения. Максимум {AUTO_MESSAGE_TEXT_MAX_LEN} символов.\n"
+        "Можно использовать HTML-разметку Telegram: <b>жирный</b>, <i>курсив</i>, ссылки.\n"
+        "Чтобы очистить текст, пришли: -",
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "admin_auto:set_media")
+async def admin_auto_set_media_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    await db_set_user_input(call.from_user.id, "admin_auto_media")
+    await call.answer()
+    await call.message.answer("Пришли фото или аудио одним сообщением. Можно также прислать голосовое. Чтобы отменить: /cancel")
+
+
+@router.callback_query(F.data == "admin_auto:clear_media")
+async def admin_auto_clear_media_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    await update_admin_auto_settings(media_type=None, media_file_id=None, updated_by=call.from_user.id)
+    await call.answer("Вложение убрано")
+    txt = await build_admin_auto_text()
+    await call.message.answer(txt, parse_mode="HTML", reply_markup=admin_auto_keyboard(), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "admin_auto:test")
+async def admin_auto_test_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    s = await get_admin_auto_settings()
+    if not str(s.get("message_text") or "").strip() and not str(s.get("media_file_id") or "").strip():
+        await call.answer("Нет текста или вложения", show_alert=True)
+        return
+    await call.answer("Отправляю тест")
+    await send_admin_auto_to_user(call.from_user.id, s)
+
+
+@router.callback_query(F.data == "admin_auto:send_now")
+async def admin_auto_send_now_cb(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    s = await get_admin_auto_settings()
+    if not str(s.get("message_text") or "").strip() and not str(s.get("media_file_id") or "").strip():
+        await call.answer("Нет текста или вложения", show_alert=True)
+        return
+    await call.answer("Отправляю всем")
+    ok, fail = await send_admin_auto_to_all(s)
+    await update_admin_auto_settings(is_enabled=False, last_sent_at=datetime.now(timezone.utc), updated_by=call.from_user.id)
+    await call.message.answer(f"📣 Отправлено. Успешно: <b>{ok}</b>, ошибок: <b>{fail}</b>. Автоотправка выключена.", parse_mode="HTML", reply_markup=admin_auto_keyboard())
 
 
 @router.callback_query()
