@@ -2303,7 +2303,13 @@ def album_keyboard(album_list: str, rank: int, artist: str, album: str, rated: O
     fav_text = "❤️ Любимое ✅" if is_fav else "❤️ Любимое"
     enc = encode_list_name(album_list)
     rows = [
-        [InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album)))],
+        [
+            InlineKeyboardButton(text="▶️ Слушать", url=(listen_url or google_link(artist, album))),
+            InlineKeyboardButton(
+                text="🟢 Spotify",
+                url="https://open.spotify.com/search/" + quote(f"{artist} {album}", safe=""),
+            ),
+        ],
         [InlineKeyboardButton(text=fav_text, callback_data=f"fav:toggle:{album_list}:{rank}"), InlineKeyboardButton(text="👤 Об артисте", callback_data=f"ai:artist:{album_list}:{rank}"), ],
         [
             InlineKeyboardButton(text="Предыдущий", callback_data="nav:prev"),
